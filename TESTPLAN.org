@@ -1,0 +1,229 @@
+#+TITLE: nngmail manual test plan
+#+OPTIONS: toc:2
+
+Work through these in order; later sections assume earlier ones pass.
+Each item says what to do, what should happen, and what to send me if it
+doesn't.  Keep =(setq nngmail-debug t)= on for the whole run so
+=*nngmail-log*= has every request; when something misbehaves, the last
+~20 lines of that buffer plus the echo-area message or backtrace is
+usually enough.  =M-x nngmail-debug-group= in the affected group is the
+other thing worth pasting (it contains no message content).
+
+Use a throwaway label for the label tests (create =nngmail-test= in the
+Gmail web UI first, or via =G m= in section 4) so nothing important gets
+moved around.
+
+* 0. Setup sanity (5 min)
+
+1. =M-x nngmail-quota-reset-policy=, then =g= in =*Group*=.
+   Expect: "gmail: up to date" (level 6, may not show) or a short
+   "checking for changes" / "fetching changed messages" and no prompt.
+2. In INBOX: =M-x nngmail-debug-group=.
+   Expect: every line in "newest 20 at Gmail" says =in-group=yes= and
+   local = live; no =MISMATCH= in the last block.  Keep this dump as a
+   baseline.
+3. =C-h v nngmail-use-plz=.  Note whether it is t (curl) or nil (url.el)
+   so we know which HTTP path you are exercising.
+4. Startup time.  With =nngmail-sync-headers= at its default =lazy=,
+   =g= after a night away must finish in seconds: one or two
+   "checking for changes" calls, no "fetching changed messages" bar
+   with thousands of messages.  Note the wall time.
+
+* 1. Reading (10 min)
+
+1. Enter INBOX with plain =RET=.  Expect: only unread + ticked shown.
+2. =C-u 200 RET=.  Expect: "checking newest 200 in INBOX" then the
+   summary with exactly 200 articles (article numbers of messages that
+   left INBOX are retired and must not count), none belonging to other
+   labels.  Spot check three older ones with =M-x nngmail-show-labels=;
+   each should list INBOX.
+3. Open a plain-text article, an HTML-only article, one with an
+   attachment, and one with umlauts or CJK in the body.  Expect: normal
+   rendering, attachment shows in the MIME buttons, non-ASCII text
+   decoded (no "K��rper").  Report: subject-free description + any
+   "Invalid base64" or decoding error.
+4. Open an article with non-ASCII subject/from.  Expect: decoded
+   correctly in the summary line and the article buffer.
+5. Second open of the same article.  Expect: instant (served from the
+   on-disk cache; no =messages/<id>?format=raw= line in the log).
+6. =A T= (or =A R=) on a message that is part of a thread.  Expect: the
+   rest of the thread appears, including messages that were not in the
+   summary before.
+7. =^= (parent) on a reply.  Expect: parent found via References.
+8. Lazy headers.  Enter a group that received mail since the last
+   sync.  Expect: a brief "fetching headers" bar sized to the summary
+   (tens of articles, one or two batch calls), then the summary.  The
+   log must not show a fetch for messages that group does not display.
+9. Label icons.  Put =%u&gmail-label-mark;= after =%R= in your summary
+   line format and =%-14,14u&gmail-labels;= before =%s=.  In a group
+   with superstarred messages, expect: a star icon in a fixed-width
+   column, every line the same height and same alignment whether it
+   holds nothing, one icon or several (2x2 grid).  Hover shows names.
+
+* 2. Marks: Gnus -> Gmail (10 min)
+
+For each, do the action in Gnus, then check the Gmail web UI (reload).
+
+1. Read an unread message (just open it).  Expect: web UI shows it read
+   within a few seconds; log shows a =messages/batchModify= with
+   =removeLabelIds ["UNREAD"]=.
+2. =M-u= (mark unread) on it.  Expect: unread again in the web UI.
+3. =!= (tick) an article.  Expect: starred in the web UI, and marked read
+   there too (Gnus cannot have ticked-but-unread).
+4. =M-c= / =d= to untick.  Expect: unstarred.
+5. Mark ten articles with =#=, then =M-r= to mark them read.  Expect:
+   ONE batchModify with all ten ids (check the log), not ten calls.
+6. =c= (catch up) in a small label group.  Expect: all read in web UI.
+
+* 3. Marks: Gmail -> Gnus (5 min)
+
+1. In the web UI, mark two read INBOX messages unread and star a third.
+   Back in Gnus, =g=, then enter INBOX.  Expect: those two appear as
+   unread, the third as ticked.
+2. In the web UI, archive an INBOX message (remove from inbox).
+   =g=, enter INBOX.  Expect: it is gone from INBOX; it is still in
+   =[Gmail]/All Mail= and in whatever labels it had.
+3. In the web UI, apply label =nngmail-test= to an existing message.
+   =g=.  Expect: the group =nngmail-test= gains one article (and it shows
+   as read/unread matching the web UI).
+
+* 4. Labels as groups (10 min)
+
+1. =G m= in =*Group*=, name =nngmail-test2=, method nngmail:gmail.
+   Expect: label appears in the Gmail web UI.
+2. In a summary, =B m= an article to =nngmail-test2=.  Expect: it
+   disappears from the current group (if the current group is a label,
+   that label is removed), appears in =nngmail-test2=, web UI agrees.
+3. =B c= (copy) an article to =nngmail-test=.  Expect: present in both
+   groups; web UI shows both labels.
+4. From =nngmail-test2=, =B m= it back to INBOX.  Expect: INBOX label
+   restored, =nngmail-test2= removed.
+5. =G r= rename =nngmail-test2= to =nngmail-test3=.  Expect: web UI
+   shows the new name, group contents intact, article numbers and read
+   marks unchanged, and the rename takes about a second even on a big
+   account (it moves the group, it does not refile the index).
+6. =G DEL= on =nngmail-test3=.  Expect: label deleted in the web UI;
+   messages themselves untouched (still in All Mail); the label is gone
+   from their label icons at once (not only after the next sync).
+7. Nested label: in the web UI create =nngmail-test/sub= and label a
+   message with it.  =g=.  Expect: group named =nngmail-test/sub= with
+   that message.
+8. In the web UI rename =nngmail-test/sub= to =nngmail-test/other=.
+   =g=.  Expect: the group follows the new name, same article numbers.
+9. In the web UI delete =nngmail-test/other=.  =g=.  Expect: the group
+   is empty and the message no longer shows that label.
+10. =M-x nngmail-rebuild-groups=.  Expect: a progress bar, then every
+    group has the same size as before (the incremental label changes
+    left nothing behind).
+
+* 5. Trash, expiry, spam (10 min)
+
+1. =B DEL= on an article in =nngmail-test=.  Expect: it moves to
+   =[Gmail]/Trash= (web UI: in Trash), gone from All Mail and from the
+   label group.
+2. In =[Gmail]/Trash=, =B m= it back to =nngmail-test=.  Expect:
+   untrashed, label restored, back in All Mail.
+3. =E= (expirable) on two articles in =nngmail-test=, then =C-c M-C-x=
+   (expire now) or =M-x gnus-summary-expire-articles-now=.  Expect:
+   both in Trash.  (Default =nngmail-expire-action= is =trash=.)
+4. =(setq nngmail-expire-action 'archive)=, repeat 3 on another article.
+   Expect: label removed, message NOT trashed (still in All Mail).
+   Set it back to =trash= afterwards.
+5. In =[Gmail]/Trash=, =B DEL= on an article you don't want.  Expect:
+   permanently deleted (web UI: gone from Trash).  Then =G x= (expunge)
+   on the Trash group with a couple of test messages in it.  Expect:
+   Trash emptied.  BE SURE only test messages are in Trash first.
+6. Open =[Gmail]/Spam=.  Expect: it lists spam; opening one works.
+   =B m= a spam message to INBOX.  Expect: unspammed in the web UI.
+
+* 6. Sending (10 min)
+
+Set =(setq message-send-mail-function #'nngmail-message-send-mail)= for
+this section (revert afterwards if you prefer smtpmail).
+
+1. =m=, send a plain message to yourself.  Expect: arrives; appears in
+   =[Gmail]/Sent Mail= after =g=; the log shows =messages/send=.
+2. =r= reply to it, send.  Expect: threads correctly in the web UI
+   (In-Reply-To/References preserved, and the send carries Gmail's
+   =threadId=; the log line for =messages/send= is the place to look).
+3. Send with an attachment (=C-c C-a=, a small binary file).  Expect:
+   attachment intact on receipt.
+4. Send with a non-ASCII subject and body (e.g. "Tëst ✓").  Expect:
+   correct on receipt, no mojibake.
+5. =gnus-posting-styles= / =X-Message-SMTP-Method= users: send from a
+   second From address if you have one.  Expect: the account is picked
+   by matching From against =nngmail-user=; report which server the
+   message went through (log line "sent message id").
+6. =S D r= (resend/bounce) an article to yourself.  Expect: arrives.
+
+* 7. Search (10 min)
+
+All from =*Group*= with point on =nngmail:gmail= (or a group of it).
+
+1. =G G=, query =from:nagios newer_than:7d=.  Expect: nnselect group
+   of matching articles; opening one works; marks set there propagate
+   to Gmail.
+2. =G G=, query =has:attachment larger:5M=.  Expect: results.
+3. =G G=, a parsed-syntax query: =subject:standup since:1w=.  Expect:
+   translated (log shows =q=subject:standup after:YYYY/MM/DD=).
+4. =G G= from inside a specific label group with =C-u= to limit scope.
+   Expect: =label:...= appended to the query in the log.
+5. =G G=, a query that hits a message NOT yet indexed (old).  Expect:
+   the message is fetched and shown; afterwards it is also visible via
+   =C-u N RET= in its label group.
+6. =/ / = (limit to subject) inside a large summary — not nngmail
+   specific, just confirm nothing odd.
+
+* 8. Sync robustness (15 min, can be done last)
+
+1. Kill Emacs (=C-x C-c=) while a =C-u 2000 RET= fetch is running.
+   Restart Gnus, =g=.  Expect: "resuming interrupted sync (N messages
+   left)" then completion; no duplicates, no relist.
+2. Quota: =M-x nngmail-backfill=, count =all=, query empty.  At the
+   first prompt answer =w=.  Expect: countdown "pausing 43s ... 42s ...",
+   then it continues and asks again at the next overrun.  Then =W=.
+   Expect: no more prompts, periodic countdowns.  Let it run until
+   "whole mailbox reached" or abort with =a= after a few windows.
+3. After 2, =g= and enter a couple of groups.  Expect: no change in
+   behaviour, counts sane, no duplicates in summaries.
+4. Toggle =nngmail-use-plz= to the other value, =nngmail-reset=, reopen.
+   Expect: identical behaviour on the other HTTP path.  (Only if you
+   have time; a full re-sync.)
+5. Expire the token: =(nngmail--force-refresh (nngmail--account "gmail"))=
+   then =g=.  Expect: transparent refresh, log shows "401 from Gmail,
+   refreshing token" at most once, no prompt.
+6. Revoke: in Google Account > Security > Third-party access, remove the
+   app.  =g=.  Expect: a clear error (not a hang), and on the next open
+   the loopback consent flow runs again and everything resumes.
+7. Slow Gmail is visible, never a hang.  While a big backfill runs,
+   watch the status line: any single request that takes more than 5 s
+   shows "waiting for Gmail  Ns" and never exceeds
+   =nngmail-request-timeout= (60 s) before a retry.  Emacs stays
+   responsive (no beachball; =C-g= answers within a second).
+8. Demon overlap.  With =gnus-demon= (or a timer calling
+   =gnus-group-get-new-news=) enabled, start a =C-u 2000 RET=.  When
+   the timer fires mid-fetch, expect: nothing visible, the fetch
+   continues, and the log (at trace level) says "scan skipped, ...
+   already in flight".  No second progress bar, no
+   "concurrency limit hit" burst.
+9. Batch ceiling.  After any "concurrency limit hit" line, expect the
+   batch size to stay at or below the reported ceiling for the rest of
+   the session (no oscillation every 30 s).  =M-x nngmail-reset-limits=
+   forgets it.
+
+* 9. Multiple accounts (optional)
+
+If you have a second Gmail account: add a second =(nngmail "other"
+(nngmail-user ...))= method.  Expect: both open, separate state files
+under =nngmail-directory=, sending picks the right one from From, search
+from each server hits only that account.
+
+* What to send me
+
+For each failure: the section/item number, what you saw, the tail of
+=*nngmail-log*=, and for anything involving group contents the
+=nngmail-debug-group= dump.  For a Lisp error, the backtrace
+(=(setq debug-on-error t)= if it is not already).
+
+Nice-to-know afterwards: roughly how long =C-u 1000 RET= took the first
+time versus the second, and whether any operation felt sluggish.

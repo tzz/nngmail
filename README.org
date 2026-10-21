@@ -1,0 +1,751 @@
+#+TITLE: nngmail — a native Gmail backend for Gnus
+
+nngmail talks to the Gmail REST API instead of IMAP.  It reuses the OAuth2
+token that =oauth2.el= / =auth-source-xoauth2-plugin= already obtain, so if
+Gnus can reach Gmail over IMAP with xoauth2 today, nngmail works with the same
+auth-source entry and no new consent screen.
+
+* Requirements
+
+- Emacs 29.1 or newer, built with SQLite (=--with-sqlite3=; the official
+  and Homebrew builds are).  =M-: (sqlite-available-p)= must return =t=.
+  nngmail keeps its whole index in one SQLite file per account and does
+  not start without it.
+- =oauth2= 0.19+ from GNU ELPA
+- optional: =plz= from GNU ELPA plus =curl= on PATH (much faster than url.el;
+  used automatically when present, see =nngmail-use-plz=)
+- a Google OAuth client with the scope =https://mail.google.com/= (the same
+  one used for IMAP xoauth2; the full-mail scope covers the REST API)
+- optional: =transient= 0.7+ for the =L L= menu (=nngmail-menu.el=)
+- optional: the =pills= package; when loaded, nngmail's mode-line and
+  status pills are drawn with it, so they match any other pills on
+  your screen
+
+* Setup
+
+Your =~/.authinfo.gpg= entry stays as it is for the xoauth2 plugin:
+
+#+begin_example
+machine work-gmail login you@example.com port imaps auth xoauth2
+  auth-url https://accounts.google.com/o/oauth2/auth
+  token-url https://accounts.google.com/o/oauth2/token
+  client-id 123.apps.googleusercontent.com client-secret GOCSPX-...
+  redirect-uri http://localhost:8999 scope https://mail.google.com/
+#+end_example
+
+The same entry in auth-source's JSON format (a file listed in =auth-sources=
+with a =.json= extension, e.g. =~/.authinfo.json.gpg=):
+
+#+begin_src json
+[
+  {
+    "machine": "gmail",
+    "login": "you@example.com",
+    "auth": "xoauth2",
+    "auth-url": "https://accounts.google.com/o/oauth2/auth",
+    "token-url": "https://accounts.google.com/o/oauth2/token",
+    "client-id": "123.apps.googleusercontent.com",
+    "client-secret": "GOCSPX-...",
+    "redirect-uri": "http://localhost:8999",
+    "scope": "https://mail.google.com/"
+  }
+]
+#+end_src
+
+Keys map as in netrc: =machine= is =:host=, =login= is =:user=; every other
+key becomes a keyword of the same name.  No =port= is needed for nngmail
+(it talks HTTPS, not IMAP), but adding =\"port\": \"imaps\"= lets the same
+entry serve nnimap and the xoauth2 plugin too.
+
+nngmail looks the entry up by =:host= = the nngmail server name first, then
+=gmail.com=, =imap.gmail.com=, =smtp.gmail.com=.  Set =nngmail-auth-host= in
+the select method if your entry is named differently.  The lookup bypasses
+=auth-source-xoauth2-plugin='s advice and auth-source's result cache, so a
+stale negative cache entry from an earlier failed search cannot hide the
+entry.
+
+In =~/.gnus=:
+
+#+begin_src emacs-lisp
+(require 'nngmail)                      ; from MELPA, or a checkout on `load-path'
+(require 'nngmail-background)           ; optional: keep Gmail in sync without blocking
+(require 'nngmail-menu)                 ; optional: `L L' transient menu (needs transient)
+
+(add-to-list 'gnus-secondary-select-methods
+             '(nngmail "work-gmail"
+                       (nngmail-user "you@example.com")))
+
+;; Send through the Gmail API with the same token (no SMTP needed):
+(setq message-send-mail-function #'nngmail-message-send-mail)
+#+end_src
+
+Sending waits for Gmail's answer, as message.el expects, but Emacs is
+not frozen meanwhile: the status line shows =gmail: sending "subject"
+to …= with the spinner running, redisplay happens, and =C-g= aborts the
+send (the message buffer stays).  A long wait is shown in the
+connections gauge as =waiting Ns=.
+
+Then =^= in =*Group*=, find =nngmail:work-gmail=, and subscribe to the groups
+you want (=INBOX=, user labels by name, =[Gmail]/All Mail=, ...).
+
+The first open lists the newest =nngmail-initial-limit= messages (2000) plus
+up to =nngmail-label-limit= (500) per label, fetches their headers in
+batches, and stores state under =nngmail-directory=.  Later opens use
+=history.list= and only touch what changed.
+
+* Model
+
+- Inside nngmail every message has one server-wide number, assigned in
+  the order nngmail first saw it.  Gnus, however, sees a dense per-group
+  numbering -- article 1..N of each group, in the order messages entered
+  it -- exactly as nnimap shows per-mailbox UIDs.  A message with three
+  labels is in three groups under three different local numbers; the
+  map is kept in the database.  A local number is retired when its
+  message leaves the group and is never reused, so a message that comes
+  back gets a new one.  This is what keeps a 2.5-million-message account
+  quick: a group's read range is a few spans however big the group is,
+  there are no gaps to describe, and updating a group's counts costs
+  time proportional to its unread messages, not its size.
+- =UNREAD= ↔ unread, =STARRED= ↔ ticked, synced both ways.  Ticking also
+  marks read (Gnus has no ticked-but-unread), matching nnimap.  Read
+  marks reach Gmail per =nngmail-mark-propagation=: =on-exit= (the
+  default) is plain Gnus, marks go out with =q= and are discarded with
+  =Q=; =immediate= sends them as you read, like an IMAP client, and =Q=
+  (exit without updating) puts back what that summary changed.  In both
+  modes a group's info is frozen while its summary is open, so a sync in
+  between cannot lose marks; the =*Group*= line keeps its entry-time
+  counts until you leave, as with nnimap.
+- Labels versus moving.  A Gmail message carries a set of labels and a
+  group shows one of them, so "move" is relative to the group you are
+  in: =B m= from group A to group B removes label A and adds label B,
+  and every other label stays.  =B c= adds B and removes nothing.
+  Moving out of Trash or Spam restores the message.  From All Mail,
+  which is no label, =B m= is a copy.
+- Editing the label set.  In an nngmail summary the =L= prefix
+  (=nngmail-summary-label-prefix-key=) edits labels directly, for the
+  article at point or the process-marked ones, in one request:
+  =L e= edit the whole set with completion (current labels preselected),
+  =L += add one, =L -= remove one (offers only labels the articles have),
+  =L a= archive in Gmail's sense (remove INBOX, keep everything else),
+  =L l= show the labels, =L ?= decode the icons.  State labels (UNREAD,
+  STARRED, categories) are marks, not labels, and are never offered.
+- =E= / expiry follows =nngmail-expire-action=: =trash= (default), =archive=
+  (remove the current label only) or =delete=.  Expiring from the Trash group
+  deletes permanently.  =G x= (expunge) on the Trash group empties it.
+- =G m= creates a label, =G DEL= deletes one, =G r= renames.  These
+  touch only the label concerned: a rename moves the group's article
+  numbers to the new name (read and starred state come along, as Gnus
+  itself moves the group's info), a deletion strips the label from the
+  messages that carried it.  The same happens when a label is renamed
+  or deleted from the web UI: the next sync notices the changed label
+  list.
+- =A T= / =A R= fetch the whole Gmail thread via =threads.get=.
+- Search (=G G=) accepts Gmail's own syntax (=from:alice newer_than:7d
+  has:attachment=) or Gnus' parsed syntax; results land in a virtual group
+  backed by =[Gmail]/All Mail=.
+
+** Storage
+
+Each account is one SQLite file, =NAME.sqlite= under =nngmail-directory=
+(plus its =-wal= and =-shm= companions while open).  It holds the
+article-number ↔ Gmail-id map, every message's labels, the NOV headers,
+the per-group numbering, the raw text of articles that have been read,
+and the sync and import checkpoints.  In memory nngmail keeps only the id map, the labels and
+the per-group article lists -- about 90 bytes a message, measured -- and
+reads headers from the file when a summary asks for them (a 500-line
+summary is a few milliseconds).  Opening a 100,000-message account takes
+0.2 s.
+
+Writes are transactions: a sync or import commits after every chunk, so
+a crash loses at most the chunk in flight, and there is no periodic
+whole-state rewrite.  Cached article text is bounded by
+=nngmail-article-cache-max= (512 MB); the least recently read go first.
+=M-x nngmail-reset= deletes the file.
+
+Older nngmail versions kept the same data in =NAME.eld= and an
+=articles/= directory.  On first open those are imported into the
+database and the =.eld= renamed to =.eld.migrated=; nothing else about
+your Gnus setup changes, and =.newsrc.eld= is not involved.
+
+** Startup cost
+
+A refresh is one =history.list= call per 500 changes (2 units each).
+Every history record carries the message id and its current labels, and
+that is all that group membership and unread counts need.  So by
+default (=nngmail-sync-headers= =lazy=) nngmail files new arrivals from
+history alone and fetches their headers only when a summary buffer
+shows them, in one batch for exactly those articles.  This is how IMAP
+backends behave.  Read, star and archive changes never need a header
+fetch in either mode.
+
+Set =nngmail-sync-headers= to =eager= to fetch every new arrival's
+headers during the sync instead: slower start, no network wait when a
+group opens.
+
+* The Gmail rate limit, and what the console will and won't let you raise
+
+The limit a backfill hits is Gmail's *per-user* limit: 250 quota units per
+second averaged over a minute, i.e. 15,000 units per minute.  At 5 units
+per message that caps header indexing at about 3,000 messages a minute; a
+100,000-message mailbox is therefore ~35 minutes at best.  The limiter is
+a token bucket, so at the edge you see a steady trickle of one or two
+rejected parts per batch rather than long lockouts; nngmail's pacer models
+the same bucket and sits just under it, which is the fastest legal rate.
+
+The Cloud console (https://console.cloud.google.com/apis/api/gmail.googleapis.com/quotas,
+project = the =project_number= in the error message) shows two rows that
+look relevant, and it is easy to pick the wrong one:
+
+- *Units per minute per user*: shows "Unlimited".  This is the newer
+  project-level metric and is not what rejects your requests; there is
+  nothing to raise here.
+- *Previous quota: Units per minute per user*: shows 15,000, which
+  matches the enforced limit exactly.  This is the row to edit.  Its
+  dialog accepts 0-15,000 and, for values above that, says "You can't
+  request more quota because your project is not linked to a billing
+  account".
+
+So raising it requires linking a billing account to the project first
+(Billing → Link a billing account).  That costs nothing for Gmail API
+use, which has no per-call charge, but needs a payment method on file.
+Once linked, submit the request with a one-line justification.  Whether
+Google grants per-user increases, and how large, is at their discretion;
+project-wide increases are routinely auto-approved but per-user ones are
+reviewed more carefully, so treat it as worth trying rather than a sure
+thing.  If granted, =(setq nngmail-quota-per-minute NEW-LIMIT)= so the
+paced backfill option uses it; no API exposes the granted figure to a
+mail-scoped token.
+
+Other things worth knowing: the console's "Current usage" graph is a
+smoothed average and shows a fraction of the limit even while requests
+are being rejected; =Too many concurrent requests for user= is a separate
+concurrency limit that nngmail handles by reducing parallel batches; and
+an OAuth client still in "Testing" status has lower daily quotas until
+published (internal publishing suffices for a Workspace account), which
+shows up as a daily error rather than this one.
+
+* Background sync (nngmail-background.el)
+
+Like the web client, nngmail keeps the index current in the background
+and Gnus reads the local copy.  =g=, entering a group and =M-g= return
+at once with what the index knew a moment ago, and a timer-driven job
+brings it up to date: it polls =history.list= every
+=nngmail-background-interval= seconds (120; a =g= polls at once),
+applies each page and checkpoints it, then fetches the headers of what
+history left to fetch, one batch per step.  No step waits on the
+network: each sends one request through plz with a callback that
+schedules the next step, or does a bounded piece of local work.  Typing
+and scrolling never stall on Gmail.
+
+The job reports in the mode line, not the echo area
+(=nngmail-background-status=, default =mode-line=): next to the spinning
+G a glyph and a figure say the phase and counts (=…= checking, =↻ 6,000=
+applying, =↓ 120/340= fetching, =… 7s= a long request;
+=nngmail-mode-line-glyphs=), and when a pass ends the G goes still.  The account name is added only when more than one
+nngmail server is open; the G already says Gmail.  Hover for the words.
+
+Between passes the G carries count pills (=nngmail-mode-line-counts=,
+default unread in INBOX, starred anywhere, and the indexed total):
+=12 unread= in purple, =3 ★= in amber, =2.68M= in grey, drawn from the
+local index, so they move as you read and star mail, not only when a
+sync ends.  Pills and the G are drawn raised (=nngmail-pill-style=): a
+slight top-to-bottom gradient, a soft shadow beneath and a hairline
+highlight along the top, with the text flat on top at full contrast;
+=flat= gives one colour.  A zero count shows no pill; nil shows none.  The indicator
+goes at the front of =global-mode-string= (=nngmail-mode-line-position=),
+before the clock, so a narrow window truncating the mode line from the
+right keeps it.  Gnus buffers (=nngmail-mode-line-modes=) also show
+the G alone after the mode name, =(Group G Plugged Topic …)=, spinning
+while nngmail works, where efrit puts its own mark.  With efrit 0.12.13+ the same indicator also follows
+efrit's agent header (=nngmail-efrit-header-indicator=, via
+=efrit-agent-header-extra-functions=), so it stays in sight while you
+watch agents.
+
+Nothing a background pass does writes to the echo area, so the
+minibuffer and other messages are left alone.  Set it to =echo-area= to
+get the full status line (bars and gauges) and a regular done message,
+as synchronous operations you start yourself still do.  =L L B= (=M-x
+nngmail-background-status=) says what the job is doing in words.
+
+The job never asks a question.  When the quota bucket is low it sleeps
+for the refill time (the status line says =pacing Ns=), and when Gmail
+rejects parts it halves the batch and waits as the synchronous path
+does.  =L L S= (=M-x nngmail-background-stop=) is the abort: progress is
+kept, and =L L G= (=M-x nngmail-background-start=) or the next =g=
+resumes.  Errors back the job off exponentially up to
+=nngmail-background-backoff-max= (300 s); the state is kept, so the
+request that failed is sent again.
+
+Only one background request is out per account, and it holds the same
+slot the synchronous batch code uses, so a mark push or an article
+fetch that runs while the job has a request out waits as before.  A
+brand-new account (no history id yet) still does its first sync
+inline, since there is nothing to show while it runs; so does a
+=history.list= 404 (history expired), which is a full sync.
+
+=nngmail-background= nil restores the old behaviour: syncs run inline
+and Emacs waits for them.  The job needs plz; with url.el syncs are
+inline regardless.
+
+* Quota, interruptions and resuming
+
+Gmail meters API usage in "quota units" (=messages.get= is 5 units,
+=history.list= 2, =send= 100) with a per-user limit of 15,000 per minute
+and a much larger per-project limit.  Separately, it applies burst and
+concurrency limits that show up as 429 / =rateLimitExceeded= on individual
+parts *inside* an otherwise successful batch; these are not the minute
+budget and nngmail treats them differently: rate-limited parts are retried
+with a smaller batch after a short pause, never dropped.
+
+Metadata is fetched with the batch endpoint, =nngmail-batch-size= (100, the
+maximum) messages per HTTP request, and with plz up to
+=nngmail-batch-parallel= (4) batches in flight at once.
+
+Everyday use (reading, marking, =g=) never comes near the limit and is not
+paced.  Only a backfill can, so =M-x nngmail-backfill= asks how to pace that
+run: no pacing (just react to Gmail's rejections), 15,000 units/min
+(Gmail's per-user limit; the sensible choice on a dedicated project),
+12,000 or 7,500 to leave headroom on a shared one, or =adaptive= (unpaced
+until Gmail pushes back, then 15,000).  You can also type a number
+(=9000=, =9,000= or =9k=).  The choice applies to that backfill only; set
+=nngmail-backfill-pace-default= to skip the question, and
+=nngmail-backfill-pace-choices= to edit the menu.  =nngmail-quota-pacing=
+(default nil) controls pacing outside backfills, should you ever want it.
+
+Why pace at all when Gmail enforces the limit anyway?  Because rejections
+are not free: a rejected batch is a wasted round trip and a retry, and
+Gmail's limiter is a sliding window that penalises bursts, so an unpaced
+client alternates between full speed and being locked out.  A paced one
+sits just under the limit with the same throughput and far fewer pauses.
+=M-x nngmail-pause-report= shows how much time went to which kind of
+pause, if you want to compare.
+
+When the budget is hit on a synchronous run (backfill, import), =nngmail-quota-policy= decides what happens:
+
+- =ask= (default) shows the limit, our current rate, and offers
+  =[t]hrottle= (continue at =nngmail-throttle-fraction= of the budget for
+  the rest of the session), =[w]ait= (pause until the window clears), or
+  =[a]bort=.
+- =throttle=, =wait=, =abort= apply that choice silently.
+
+Aborting is safe.  State is checkpointed to disk every
+=nngmail-sync-chunk= messages and again on any non-local exit (abort,
+=C-g=, error), including the list of ids still to fetch.  The next sync
+(any =g=) resumes from that list without relisting; a full sync that was
+cut short adopts its historyId only once its fetch completes, so no
+changes are missed.  You can also just quit Emacs mid-sync.
+
+Back-to-back sync requests within =nngmail-sync-debounce= seconds (20)
+are collapsed into one, since Gnus asks a backend to scan several times
+per =g=.
+
+* Getting older mail
+
+The initial sync indexes only recent mail (see =nngmail-initial-limit=).
+There are two ways to reach further back:
+
+- =C-u N RET= on an nngmail group makes sure the newest N messages carrying
+  that label are indexed before the summary is built, fetching any that
+  are missing.  So =C-u 1000 RET= on INBOX is "show me the last thousand
+  INBOX messages", exactly as in nnimap.  When nothing is missing it
+  costs one cheap listing call per 500 requested and no header fetches.
+  Set =nngmail-fetch-on-demand= to nil to disable.
+- =M-x nngmail-backfill= for anything broader.  The first prompt is a menu
+  (=nngmail-backfill-choices=): last 30 days, 6 months, a year, 2 years,
+  1,000 or 10,000 more messages, or everything.  You can also type an
+  answer directly: a number of messages (=5000=), a duration (=30d=, =6m=,
+  =2y=, =3 weeks=), or a date (=2024-01-01= or =2024-06=; a bare number
+  is always a count, never a year).  A time
+  window is much cheaper than a count on a big mailbox because Gmail
+  filters server-side, so the scan never touches older messages.  The
+  second prompt takes a further Gmail query (=label:inbox=, =from:alice=)
+  that is combined with the time window; empty means no further
+  restriction.  The third prompt picks pacing (default =adaptive=, which
+  runs at full speed until Gmail pushes back and then paces at the
+  limit).  A backfill can be interrupted and resumes on the next call.
+
+** Why backfills go over IMAP
+
+The REST API meters every =messages.get= at 5 quota units against a
+per-user budget of 15,000 units a minute, so a header index built over
+REST can never exceed about 3,000 messages a minute however the
+requests are arranged.  Gmail's IMAP endpoint has no such meter.  One
+=UID FETCH= streams headers for thousands of messages at network
+speed, and Gmail's IMAP extensions return, per message, the same id
+the REST API uses plus the thread id and the labels.  That is
+everything the index needs.
+
+The first time a server opens with an empty index, nngmail offers to
+import the whole mailbox this way before anything else
+(=nngmail-offer-import=: =ask=, =always=, or nil to skip the offer).
+Declining leaves you with the normal first sync -- the newest
+=nngmail-initial-limit= messages plus a per-label top-up -- and
+=M-x nngmail-backfill= adds the rest whenever you like.
+
+=nngmail-backfill= asks which server to use, and every account is
+offered twice: =gmail (IMAP: fast, whole mailbox or a count)= and
+=gmail (REST: Gmail queries, time windows; ~3,000 msg/min)=.  Over
+IMAP it logs in with the OAuth token nngmail already holds (XOAUTH2,
+so no app password), walks =[Gmail]/All Mail=, then Spam and Trash,
+and files each message exactly as a REST fetch would.  The connections
+are private to the import and closed at the end; no nnimap server or
+group is created.  IMAP cannot evaluate Gmail search syntax, so the
+IMAP server offers only counts and "all", and asks for no query; time
+windows, dates and =from:= style filters are the REST server's job.
+
+IMAP must be enabled for the account (Gmail settings, "Forwarding and
+POP/IMAP").  If it is not, or the connection is refused, the backfill
+says so in a warning, does the same job over REST at REST speed, and
+lists the IMAP server as unavailable for the rest of the session;
+=M-x nngmail-imap-retry= after enabling it.
+
+The REST path itself is quicker than before: the next listing page is
+requested while the current page's headers are fetched, and each page
+is committed to the database as it lands.
+
+* The status line
+
+While nngmail talks to Gmail it keeps one line in the echo area, laid
+out in fixed columns so nothing jumps as numbers change:
+
+: gmail: backfilling   [████ 4,500/5,000 90%  ~12s left ] │ [▎ 204,077 scanned  ~10h40m left  33,505 new] │ at limit: 2 bounced, retry 8s
+
+The first bar is the current phase (fetching headers, indexing,
+applying changes).  Its label sits inside the lozenge: done/total,
+percentage and a time estimate.  The estimate is a smoothed rate over
+recent progress (=nngmail-eta-smoothing=), not an average since the
+start, so it tracks the current speed through pauses and throttling;
+it appears after =nngmail-eta-after= (3) seconds.  Without a total it
+shows the count and the elapsed time instead.
+
+The second bar appears during a backfill: how much of the mailbox has
+been scanned (light) and how much of that was new (dark), with its own
+counts and an estimate for the whole scan.  It is only drawn for
+whole-mailbox backfills; a query- or label-restricted backfill has no
+meaningful total and shows numbers only.
+
+Pauses of any kind (pacing, concurrency limit, rate limit, network
+retry, a slow answer from Gmail) show with a live countdown inside the
+gauges described below instead of overwriting the progress, and the
+phase bar turns amber while paused.
+
+Every cell of the line is a lozenge of constant width: the phase
+(=gmail: applying changes=), the progress bar, the extra column (a
+backfill's mailbox scan, a history pass's page count and rate), and
+the two gauges.  Nothing on the line is bare text, and nothing shifts
+when the text inside a cell changes.  The gauges are lozenges with a
+vertical meter at their left and their figures inside; every transient
+condition shows inside the gauge it belongs to, tinted amber (waiting,
+pacing, throttled) or red (an error, the quota prompt).
+
+The connections gauge (=nngmail-connection-gauge-width=, 30 cells)
+shows =3/8 conns=, the requests in flight against
+=nngmail-batch-parallel=, one lit segment each.  While a request is
+slow or being retried it shows the reason and countdown too:
+=3/8 conns  waiting 12s=, =3/8 conns  net error, retry 4s=.
+
+The quota gauge (=nngmail-gauge-width=, 22 cells) shows =quota 82%=,
+the pacer's token bucket, green above a quarter, amber below, red at
+empty.  While the pacer holds a request it shows =pacing 43s=; when you
+chose to throttle it says so; and while the quota prompt is up it shows
+the rate that triggered it in red.  Hover either gauge for detail.
+
+While nngmail talks to Gmail a spinning G appears in the mode line
+(=global-mode-string=), with the phase and counts as its tooltip.  The
+echo area is shared with every other message in Emacs; the spinner is
+the indicator that stays visible.  Its timer also redraws the status
+line, so a long single request no longer leaves a stale line.
+
+On a graphical display with SVG support the bars are images
+(=nngmail-status-bar= =auto=) with the label drawn inside; in a
+terminal, or with =nngmail-status-bar= set to =text=, they use Unicode
+block characters with the label after them.  When the label does not
+fit the bar, fields drop from the right.  =nngmail-status-width= (nil: the
+echo area's width, so the last column uses the whole frame),
+=nngmail-status-bar-width= (30) and =nngmail-status-font-scale= (0.62,
+label height as a fraction of the line) control the geometry; the label
+is pinned to its width inside the lozenge and drops fields from the
+right, so it cannot spill out at any width.  None of this
+goes to =*Messages*= or the log; the log gets one line per phase change
+(with the total), one when a phase of 5 s or more finishes (with how
+long it took), and one per pause.
+
+* Showing a message's other labels
+
+A message can carry several labels, so it appears in several groups.
+Three named format specs make that visible in the summary line.  The
+=u= is required: =%u&name;= calls a user function, while =%&name;= is
+reserved for Gnus's own specs like =user-date=.
+
+| =%u&gmail-label-mark;=  | a fixed-width cell: empty, =&=, or the icons, pixel aligned |
+| =%u&gmail-labels;=      | the other labels, icons first, then names         |
+| =%u&gmail-label-count;= | the number of other labels, or empty              |
+
+"Other" means every label except the group you are in, Gmail state
+labels (=nngmail-summary-hidden-labels=) and quarantine labels.  For
+example:
+
+#+begin_src emacs-lisp
+(setq gnus-summary-line-format
+      "%U%R%u&gmail-label-mark; %10&user-date; %(%-20,20a%) %-14,14u&gmail-labels; %s\n")
+#+end_src
+
+Gnus compiles the format once.  After a change, run =M-x
+gnus-update-format= or restart Gnus.
+
+** Icons for labels
+
+=nngmail-label-display-alist= maps a label id or name to an icon and an
+optional face.  An icon is either a shape name from
+=nngmail-label-shapes= (=star=, =circle=, =square=, =diamond=,
+=triangle=, =heart=, =flag=, =check=, =bang=, =question=, =info=,
+=chevron=, =person=) or a string such as an emoji.  Gmail's superstars
+are built in: =YELLOW_STAR= is a gold =star=, =GREEN_CHECK= a green
+=check=, and so on.  Add your own:
+
+#+begin_src emacs-lisp
+(push '("Team Lead" person :foreground "sky blue") nngmail-label-display-alist)
+(push '("urgent" bang :foreground "red") nngmail-label-display-alist)
+(push '("fun" "🎉") nngmail-label-display-alist)   ; text icon
+#+end_src
+
+Prefer shapes over emoji.  Shapes are vector graphics drawn by nngmail,
+so they are the same size and colour on every line and need no emoji
+font.  Emoji are drawn as text inside the image and depend on the fonts
+librsvg finds.  For rules that a table cannot express, set
+=nngmail-label-display-function= to a function of =(LABEL-ID NAME)=
+that returns a shape, a string, an =(ICON . FACE)= pair, or nil to fall
+back to the alist.
+
+** The mark cell
+
+On graphical displays =%u&gmail-label-mark;= is one SVG image exactly
+=nngmail-label-mark-width= cells wide (2 by default) and one line high,
+so it can never shift the columns after it or change the line height.
+It is empty when the message lives only here, =&= when the other labels
+have no icons, one icon filling the cell, or up to four icons in a 2x2
+grid.  Hover over the cell for the label names.  On text terminals the
+first icon's fallback character is shown instead.
+
+=M-x nngmail-summary-explain-labels= prints a legend for the article at
+point (=★ = YELLOW_STAR  🧑 = Team Lead  wiki=).  The article buffer also
+gets an =X-Gmail-Labels= header with every label by name
+(=nngmail-article-labels-header=).
+
+* The menu (nngmail-menu.el)
+
+Loaded with nngmail.  An *nngmail* entry in the menu bar of nngmail
+summary and group buffers, and =L L= in a summary opens =nngmail-menu=,
+a transient with every command and its key: the label commands, the
+efrit commands (when efrit is installed), backfill and account
+operations, diagnostics, reload and reset.  Needs transient 0.7 (in
+Emacs 30; from ELPA on 29); without it nngmail loads without the menu
+and says so.
+
+* Asking efrit about your mail
+
+The analysis commands live in [[https://github.com/steveyegge/efrit][efrit]] itself, in =efrit-gnus.el=, and
+work for every Gnus backend: =C-c g a= the selection (region, process
+marks, or point), =C-c g t= the thread, =C-c g u= all unread in a group,
+=C-c g g= the newest N, =C-c g s= a Gnus search.  Each opens a menu of
+prompts (efrit's prompt library, =efrit-prompts.el=: summarize, action
+items, draft replies, who and what, timeline, triage, extract, tone
+check, "trends, accomplishments, concerns"); =/= types a question
+instead and =e= opens the prompt manager (=M-x efrit-prompts-manage=,
+also =C-c g e= and =L A e=), where you edit, add, copy and delete
+prompts, and =s= asks efrit to suggest a better version, shown as a
+diff to accept or discard.  Your prompts and edits live in
+=prompts.json= under =efrit-data-directory=.  Every prompt has two
+parts: one run per batch of articles and answered per article, and one
+sent after the last batch for the answer over the whole selection.
+Large selections go out in as many turns as fit =efrit-gnus-max-chars=,
+one after another, without asking; 113 recaps become 113 short takes
+and then one briefing.  =C-c g k= (=L A k=) stops the batches still
+queued.  efrit also gets three generic tools, =gnus_groups=,
+=gnus_search= and =gnus_articles=, so the model can pull in more mail
+on its own.
+
+The separate package =nngmail-efrit= (=(require 'nngmail-efrit)=; needs
+efrit 0.13 or later, which carries =efrit-gnus.el=) adds the Gmail layer: the same commands under =L A= in
+nngmail summaries, and three Gmail-specific tools for the model,
+=gmail_search= (Gmail's query syntax over the whole account),
+=gmail_thread= (a conversation across labels) and =gmail_labels=.  All
+read-only; label editing stays with the =L= commands.  Listings carry
+both the =GROUP#NUMBER= reference efrit-gnus uses and the Gmail id.
+
+* Google Docs linked from mail (nngmail-gdocs.el)
+
+Loaded with nngmail.  Meeting recaps and the like are an email with a
+Docs link and nothing else; this fetches the doc.  The token must carry
+a Drive scope: add =https://www.googleapis.com/auth/drive.readonly= to
+the =scope= of the auth-source entry (space-separated after
+=https://mail.google.com/=), enable the *Google Drive API* for the
+project that owns your OAuth client in the Cloud console (APIs &
+Services -> Library, https://console.cloud.google.com/apis/library/drive.googleapis.com),
+add the scope on the OAuth consent screen, and run
+=M-x nngmail-reauthorize= once.  The efrit document [[https://github.com/steveyegge/efrit/blob/main/docs/DOCUMENTS.md][DOCUMENTS.md]]
+walks through the console pages, including the Workspace admin gate
+that gives 403 =admin_policy_enforced= when it is closed.
+
+** With efrit: related documents and Calendar
+
+efrit 0.4.1+ has its own document layer (=efrit-documents=, see the
+document above).  Its Drive source finds the same =gmail= entry when it
+has the Drive scope (or an entry named =gdrive=), so nothing more is
+needed for it to work.  Then:
+
+- efrit-gnus fetches linked Docs through efrit, and nngmail's
+  =gdoc_fetch= tool and link expander step aside.  The model has
+  =doc_search= over Drive (and Confluence, if configured).
+- Each analyzed article also carries /related/ documents: what Drive
+  finds by the subject's words within a few days of the Date, and --
+  with the Calendar scope below -- the attachments of the calendar
+  event the mail is about.
+- =gnus-treat-related-documents= (efrit-gnus; off by default, =W R= by
+  hand) appends a "Related documents:" footnote to the article with
+  the title, source, date and URL of each, buttonized.  An analysis of
+  that article reads the footnote and fetches those documents instead
+  of searching.  A sensible value here is ='("recaps")=.
+
+What counts as related is one function,
+=efrit-gnus-related-documents-function=, called in a buffer with the
+article (headers and decoded body) and returning document plists.
+efrit's default guesses from the subject; a mail source with a fixed
+subject format should get an exact rule in your own configuration
+(that day's calendar events, the one with that title, its notes --
+see DOCUMENTS.md for the shape).  The Calendar side needs:
+
+1. Add =https://www.googleapis.com/auth/calendar.events.readonly= to the
+   same entry's =scope=.
+2. In the Cloud console, enable the *Google Calendar API* for the
+   project (https://console.cloud.google.com/apis/library/calendar-json.googleapis.com)
+   and add the scope on the consent screen.
+3. =M-x nngmail-reauthorize= once more; consent in the browser.
+4. =M-x efrit-documents-gcalendar-check= lists the calendars the token
+   can read; =M-x efrit-documents-gdrive-check= does the same for Drive.
+
+The article washing (=gnus-treat-gdocs=) and =L D= need no efrit and
+stay as they are:
+
+- In the article buffer, as a Gnus washing treatment: the doc's text,
+  rendered from its HTML export with shr like HTML mail, follows the
+  part under a "Google Doc: TITLE" heading.  =gnus-treat-gdocs= says
+  where it happens (default: groups matching "recaps"; the usual
+  treatment values apply); =W D= applies it to any article by hand.
+- =L D= in a summary: the same docs in =*Google Docs*= as Markdown,
+  for reading at length or copying.
+- Without efrit's Drive source (an older efrit): the link expander on
+  =efrit-gnus-expand-link-functions= and the =gdoc_fetch= tool do for
+  efrit what the Drive source does in newer versions.
+
+Docs are fetched through Drive's export as Markdown, capped at
+=nngmail-gdocs-max-chars= (40k), and cached for the session by their
+=modifiedTime=.  A token without the scope, a doc not shared with you,
+or a bad id each give a specific message; the URL is always kept.
+Drive caps exports at 10 MB: a doc heavy with images is refused as
+HTML ("This file is too large to be exported"), so the washer falls
+back to the Markdown and then the plain-text export and shows that,
+without the images.
+
+* Commands
+
+- =M-x nngmail-backfill= — pull older messages into the local index (see
+  above).
+- =M-x nngmail-show-labels= — labels of the article at point; with =C-u=,
+  compare against Gmail and correct the local copy.
+- =M-x nngmail-summary-explain-labels= — legend for the label icons of
+  the article at point.
+- =M-x nngmail-verify-group= — compare the current group against Gmail's
+  newest 200 for its label and fix drift.
+- =M-x nngmail-debug-group= — dump active/info/marks, a label histogram
+  and a local-vs-live comparison to =*nngmail-debug*= (no message content).
+- =M-x nngmail-quota-reset-policy= — forget a session-wide =W= or =t=
+  answer to the quota prompt.
+- =M-x nngmail-rebuild-groups= — refile every message into its groups
+  from the labels table.  Label changes are applied incrementally, so
+  this full pass is only for when group contents look wrong; it keeps
+  existing article numbers and shows progress (about 45 s for 2.5M
+  messages).
+- =M-x nngmail-check-newsrc= — find nngmail groups whose Gnus data still
+  uses the numbering from before per-group numbers (read ranges above
+  the active high, or =unexist= marks) and offer to clear it.  Read and
+  starred state comes back from Gmail on the next =g=.
+- =M-x nngmail-reset= — drop all local state for a server; next open does
+  a full sync.  Does not touch anything at Gmail.
+- =M-x nngmail-reauthorize= — re-read the auth-source entry and get a
+  token for it afresh (after adding a scope, for Drive).
+- =M-x nngmail-efrit-reload= — =efrit-reload= then =nngmail-reload=, and
+  re-register nngmail's tools with efrit; for working on both at once.
+- =M-x nngmail-reload= (in =nngmail-reload.el=) — reload every loaded
+  nngmail library from source without restarting Emacs or Gnus.
+  Customizations, the in-memory index and queued marks survive; account
+  objects are upgraded if the struct grew, image caches are cleared,
+  and a running spinner restarts.  With a prefix argument it lists each
+  file.  A sync in progress finishes on the old code.
+- =M-x nngmail-restore-token-store= (menu =P=) — rewrite the oauth2
+  token store (=oauth2-token-file=, a symmetric plstore) from the copy
+  nngmail kept in memory the last time it decrypted.  For when a token
+  refresh saved the store under a mistyped passphrase: the oauth2
+  library rewrites the file about hourly with whatever passphrase
+  plstore has cached, and plstore caches the first answer unchecked.
+  nngmail guards against that: before each refresh it decrypts the
+  store with the cached passphrase (a wrong one is dropped and asked
+  again), it keeps the decrypted contents in memory, and an empty
+  answer at the plstore prompt is refused.  A refresh whose only
+  failure is the write-back is logged once and the token used.
+- =M-x nngmail-build-info= (menu =V=) — one line saying which code this
+  Emacs runs: =nngmail-version=, the source directory, the newest source
+  modification time, and any file edited on disk after it was loaded
+  (marked STALE: reload before trusting what you see).  The test drive
+  prints the same line under its title, so a report says which code
+  produced it.  Bump =nngmail-version= in =nngmail.el= with each change.
+
+* Variables worth knowing
+
+| =nngmail-directory=       | where each account's SQLite file lives          |
+| =nngmail-article-cache-max= | MB of raw article text kept per account (512) |
+| =nngmail-header-cache-size= | NOV headers kept in memory per account (5000) |
+| =nngmail-sync-headers=    | =lazy= (default): headers fetched when a summary shows them; =eager=: at sync |
+| =nngmail-mark-propagation= | =on-exit= (default): Gnus semantics; =immediate=: marks sent as you read, =Q= reverts |
+| =nngmail-offer-import=    | =ask= (default): offer a whole-mailbox IMAP import on first open |
+| =nngmail-imap-connections= | parallel IMAP connections for an import (8)     |
+| =nngmail-imap-chunk=      | messages per IMAP FETCH (2000)                  |
+| =nngmail-initial-limit=   | newest N messages on first sync (nil = all)    |
+| =nngmail-label-limit=     | per-label top-up on first sync                 |
+| =nngmail-hidden-labels=   | label ids never shown as groups                |
+| =nngmail-label-group-alist= | system label id → group name mapping         |
+| =nngmail-label-display-alist= | label → icon and face in the summary line  |
+| =nngmail-label-mark-width=  | columns of the =%u&gmail-label-mark;= cell     |
+| =nngmail-label-shapes=      | vector shapes usable as icons                  |
+| =nngmail-summary-hidden-labels= | label ids never listed as "other" labels |
+| =nngmail-expire-action=   | trash / archive / delete                       |
+| =nngmail-cache-articles=  | cache raw RFC 822 on disk (server variable)    |
+| =nngmail-use-plz=         | use plz/curl instead of url.el                 |
+| =nngmail-debug=           | log every request to =*nngmail-log*=           |
+
+* Tests
+
+#+begin_example
+make test        # ERT: test/nngmail-tests.el + test/nngmail-background-tests.el
+make lint        # byte-compile with warnings as errors, checkdoc
+#+end_example
+
+The suite mocks the Gmail API; no network and no account are needed.
+Tests that need =plz= or =gpg= skip when those are absent.
+=test/test-imap-server.py= is a tiny IMAP server for the import tests.
+
+=dev/= holds developer tools that are not part of the package:
+=nngmail-reload.el= (reload every nngmail library from source, keep the
+accounts) and =nngmail-testdrive.el= (=M-x nngmail-testdrive=: an
+automatic end-to-end drive against a real account, with a guided tour).
+
+* Known limitations
+
+- Header fetches for =retrieve-headers= by Message-ID are not supported
+  (article numbers only); =request-article= by Message-ID works via Gmail's
+  =rfc822msgid:= search.
+- =request-accept-article= imports via =messages.import=; the imported copy
+  gets the target label but Gmail decides threading.
+- No agent/offline support beyond the raw-article cache.
+- Drafts are shown as a normal group; editing them in Gnus does not update
+  the Gmail draft.
