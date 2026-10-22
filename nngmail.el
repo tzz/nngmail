@@ -50,8 +50,9 @@
 ;; Companion libraries in this package: nngmail-background.el (keep
 ;; Gmail in sync from a timer, never blocking Emacs), nngmail-menu.el
 ;; (a transient menu under `L L'), nngmail-gdocs.el (Google Docs linked
-;; from mail, as text).  The separate package nngmail-efrit adds efrit
-;; tools; the pills package, when loaded, draws nngmail's pills.
+;; from mail, as text), nngmail-efrit.el (Gmail tools and keys for
+;; efrit 0.13+, which is optional).  The pills package, when loaded,
+;; draws nngmail's pills.
 ;;
 ;; Setup
 ;; -----

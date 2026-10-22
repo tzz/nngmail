@@ -1,5 +1,5 @@
 EMACS ?= emacs
-PACKAGE_EL := nngmail.el nngmail-background.el nngmail-menu.el nngmail-gdocs.el
+PACKAGE_EL := nngmail.el nngmail-background.el nngmail-menu.el nngmail-gdocs.el nngmail-efrit.el
 LOAD := -L . -L dev -L test
 
 .PHONY: compile lint test clean

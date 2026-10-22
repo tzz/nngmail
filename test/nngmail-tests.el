@@ -1454,6 +1454,8 @@ group, state labels and quarantine; X-Gmail-Labels header lists all."
       (should (equal "DELETE" (car (car nngmail-test--calls))))
       (should-not (gethash 1 (nngmail-account-num->id a))))))
 
+(require 'nngmail-efrit-tests)
+
 (provide 'nngmail-tests)
 ;;; nngmail-tests.el ends here
 

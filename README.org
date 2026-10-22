@@ -17,6 +17,7 @@ auth-source entry and no new consent screen.
 - a Google OAuth client with the scope =https://mail.google.com/= (the same
   one used for IMAP xoauth2; the full-mail scope covers the REST API)
 - optional: =transient= 0.7+ for the =L L= menu (=nngmail-menu.el=)
+- optional: efrit 0.13+ for =nngmail-efrit.el=
 - optional: the =pills= package; when loaded, nngmail's mode-line and
   status pills are drawn with it, so they match any other pills on
   your screen
@@ -565,8 +566,9 @@ queued.  efrit also gets three generic tools, =gnus_groups=,
 =gnus_search= and =gnus_articles=, so the model can pull in more mail
 on its own.
 
-The separate package =nngmail-efrit= (=(require 'nngmail-efrit)=; needs
-efrit 0.13 or later, which carries =efrit-gnus.el=) adds the Gmail layer: the same commands under =L A= in
+=nngmail-efrit.el= (=(require 'nngmail-efrit)=; needs efrit 0.13 or
+later, which carries =efrit-gnus.el=; efrit is optional and not a
+package dependency) adds the Gmail layer: the same commands under =L A= in
 nngmail summaries, and three Gmail-specific tools for the model,
 =gmail_search= (Gmail's query syntax over the whole account),
 =gmail_thread= (a conversation across labels) and =gmail_labels=.  All
