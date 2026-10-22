@@ -751,3 +751,11 @@ automatic end-to-end drive against a real account, with a guided tour).
 - No agent/offline support beyond the raw-article cache.
 - Drafts are shown as a normal group; editing them in Gnus does not update
   the Gmail draft.
+
+* Authorship
+
+This package was written with substantial assistance from Claude
+(Anthropic's AI model), directed, reviewed and tested by Teodor
+Zlatanov, who maintains it and is responsible for its contents.
+Because of that, it is not offered to GNU ELPA or NonGNU ELPA, whose
+policy excludes LLM-generated contributions.
