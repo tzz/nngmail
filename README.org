@@ -67,9 +67,9 @@ entry.
 In =~/.gnus=:
 
 #+begin_src emacs-lisp
-(require 'nngmail)                      ; from MELPA, or a checkout on `load-path'
-(require 'nngmail-background)           ; optional: keep Gmail in sync without blocking
-(require 'nngmail-menu)                 ; optional: `L L' transient menu (needs transient)
+(require 'nngmail)   ; from MELPA, or a checkout on `load-path'
+;; nngmail-background (sync from a timer), nngmail-gdocs and nngmail-menu
+;; (the `L L' menu, when transient is installed) load with it.
 
 (add-to-list 'gnus-secondary-select-methods
              '(nngmail "work-gmail"
