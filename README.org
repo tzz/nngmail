@@ -752,6 +752,10 @@ automatic end-to-end drive against a real account, with a guided tour).
 - Drafts are shown as a normal group; editing them in Gnus does not update
   the Gmail draft.
 
+* License
+
+Apache License 2.0; see =LICENSE=.
+
 * Authorship
 
 This package was written with substantial assistance from Claude
