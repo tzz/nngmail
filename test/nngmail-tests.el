@@ -2565,6 +2565,94 @@ stay on the message.  `L t' is thread-wide for any label."
           (dolist (n '(1 2 3)) (should (member "Label_1" (gethash n (nngmail-account-labels a)))))
           (should-not (member "Label_1" (gethash 4 (nngmail-account-labels a)))))))))
 
+(ert-deftest nngmail-test-thread-labels-spread-on-entry ()
+  "Building a summary spreads a thread label over each displayed Gnus thread
+that has it on one member; with `gmail', over the Gmail conversation too."
+  (nngmail-test-with-mock
+      `(("POST messages/batchModify" . ((ok . t)))
+        ("GET threads/T1" . ((id . "T1") (messages . (((id . "a")) ((id . "b")) ((id . "c")) ((id . "e")))))))
+    (let ((a (nngmail-test--account))
+          (nngmail-thread-labels '("done"))
+          (nngmail--spread-seen (make-hash-table :test #'equal))
+          (gnus-newsrc-alist nil) (gnus-newsrc-hashtb nil))
+      (setf (nngmail-account-label-names a) '(("INBOX" . "INBOX") ("Label_9" . "done")))
+      (nngmail--rebuild-name-map a)
+      ;; a b c: one Gnus thread in INBOX, b has done (from a filter); d: another
+      ;; thread, no done; e: in the Gmail conversation T1 but not in INBOX
+      (nngmail--with-transaction a
+        (pcase-dolist (`(,num ,id ,tid ,labels) '((1 "a" "T1" ("INBOX")) (2 "b" "T1" ("INBOX" "Label_9"))
+                                                  (3 "c" "T1" ("INBOX")) (4 "d" "T2" ("INBOX"))
+                                                  (5 "e" "T1" ("Label_1"))))
+          (puthash id num (nngmail-account-id->num a))
+          (puthash num id (nngmail-account-num->id a))
+          (nngmail--store-header a num (make-full-mail-header num "s" "f" "d" (format "<%s@x>" id) "" 1 0 nil
+                                                              `((X-Gmail-Thread-Id . ,tid)))
+                                 labels)))
+      (nngmail--rebuild-groups a)
+      (setq gnus-newsrc-alist (list (list "nngmail+test:INBOX" 4 nil nil (list 'nngmail "test"))))
+      (gnus-make-hashtable-from-newsrc-alist)
+      (let ((local (lambda (n) (nngmail--num->local a "INBOX" n))))
+        (cl-letf (((symbol-function 'nngmail--summary-gnus-threads)
+                   (lambda () (list (mapcar local '(1 2 3)) (list (funcall local 4)))))
+                  ((symbol-function 'nngmail--refresh-summary-lines) #'ignore))
+          (with-temp-buffer
+            (gnus-summary-mode)
+            (setq gnus-newsgroup-name "nngmail+test:INBOX")
+            ;; gnus: a and c get it; d (other thread) and e (not shown) do not
+            (let ((nngmail-thread-labels-spread 'gnus))
+              (nngmail--spread-thread-labels))
+            (let ((body (nth 3 (car nngmail-test--calls))))
+              (should (equal '("a" "c") (sort (append (alist-get 'ids body) nil) #'string<)))
+              (should (equal ["Label_9"] (alist-get 'addLabelIds body))))
+            (dolist (n '(1 2 3)) (should (member "Label_9" (gethash n (nngmail-account-labels a)))))
+            (dolist (n '(4 5)) (should-not (member "Label_9" (gethash n (nngmail-account-labels a)))))
+            ;; nothing left to do: no request
+            (let ((before (length nngmail-test--calls)) (nngmail-thread-labels-spread 'gnus))
+              (nngmail--spread-thread-labels)
+              (should (= before (length nngmail-test--calls))))
+            ;; gmail: the conversation brings in e, once per session
+            (let ((nngmail-thread-labels-spread 'gmail))
+              (nngmail--spread-thread-labels)
+              (should (member "Label_9" (gethash 5 (nngmail-account-labels a))))
+              (let ((before (length nngmail-test--calls)))
+                (nngmail--spread-thread-labels)
+                (should (= before (length nngmail-test--calls)))))
+            ;; nil: off
+            (setq nngmail-test--calls nil)
+            (nngmail--set-labels a 1 '("INBOX"))
+            (let ((nngmail-thread-labels-spread nil))
+              (nngmail--spread-thread-labels)
+              (should-not nngmail-test--calls))))))))
+
+(ert-deftest nngmail-test-summary-gnus-threads ()
+  "The thread walker returns each displayed Gnus thread's articles.
+Threads are what Gnus builds from the headers: two by References (the
+second with a retitled reply under a never-delivered root) and a loner."
+  (with-temp-buffer
+    (gnus-summary-mode)
+    (let* ((mk (lambda (n subj id refs)
+                 (make-full-mail-header n subj "f" "Mon, 01 Sep 2026 10:00:00 +0000" id refs 1 0 nil nil)))
+           (gnus-newsgroup-name "nngmail+test:INBOX")
+           (gnus-show-threads t)
+           (gnus-summary-thread-gathering-function #'gnus-gather-threads-by-references)
+           (gnus-newsgroup-headers
+            (list (funcall mk 1 "one" "<1@x>" "")
+                  (funcall mk 2 "Re: one" "<2@x>" "<1@x>")
+                  (funcall mk 3 "two" "<3@x>" "<root@x>")
+                  (funcall mk 4 "retitled two" "<4@x>" "<root@x>")
+                  (funcall mk 5 "five" "<5@x>" "")))
+           (gnus-newsgroup-unreads '(1 2 3 4 5))
+           (gnus-newsgroup-limit '(1 2 3 4 5))
+           (gnus-newsgroup-articles '(1 2 3 4 5))
+           (gnus-newsgroup-data nil)
+           (gnus-newsgroup-dependencies (gnus-make-hashtable 20))
+           (gnus-summary-highlight nil) (gnus-build-sparse-threads nil) (gnus-fetch-old-headers nil))
+      (dolist (h gnus-newsgroup-headers) (gnus-dependencies-add-header h gnus-newsgroup-dependencies nil))
+      (gnus-summary-prepare)
+      (should (equal '((1 2) (3 4) (5))
+                     (mapcar (lambda (th) (sort (copy-sequence th) #'<))
+                             (nngmail--summary-gnus-threads)))))))
+
 (ert-deftest nngmail-test-summary-label-commands ()
   "Edit/add/remove/archive send exactly the label difference to Gmail, work
 on process-marked articles, and leave other labels alone."
