@@ -489,15 +489,19 @@ group later and the thread is cleared.
 says.
 
 The label may also arrive on one message from the server (a Gmail
-filter).  =nngmail-thread-labels-spread= (default =gnus=) makes nngmail
+filter).  =nngmail-thread-labels-spread= (default =(gnus)=) makes nngmail
 spread it when a summary is built: every Gnus thread shown that has the
 label on one member gets it on all members.  "Gnus thread" means the
 thread as displayed, built from References and your gathering
 function, so robots like Phabricator that cite a never-delivered
-parent are covered even though Gmail does not thread them.  Set it to
-=gmail= to also reach each labelled member's Gmail conversation
-(=threads.get=, once per conversation per session), which pulls in
-messages not shown in the group; =nil= turns it off.
+parent are covered even though Gmail does not thread them.  Add
+=gmail= to the list to also reach each labelled member's Gmail
+conversation (=threads.get=, once per conversation per session), which
+pulls in messages not shown in the group; =nil= turns it off.
+
+#+begin_src emacs-lisp
+(setq nngmail-thread-labels-spread '(gnus gmail))
+#+end_src
 
 * Showing a message's other labels
 

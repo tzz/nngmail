@@ -3,7 +3,7 @@
 ;; Copyright (C) 2026 Teodor Zlatanov
 
 ;; Author: Teodor Zlatanov <tzz@lifelogs.com>
-;; Version: 1.2.0
+;; Version: 1.2.1
 ;; Package-Requires: ((emacs "29.1") (oauth2 "0.19"))
 ;; Emacs must be built with SQLite (--with-sqlite3); see `nngmail--require-sqlite'.
 ;; Keywords: mail, news, gnus
@@ -293,7 +293,7 @@ Defaults to the nngmail server name.")
   db                  ; open sqlite object, see "Persistence"
   header-lru)         ; list of article numbers, most recently used first
 
-(defconst nngmail-version "1.2.0"
+(defconst nngmail-version "1.2.1"
   "The nngmail code version.  Bump on every change that a test drive can see.
 `nngmail-build-info' (nngmail-reload.el) prints it with the source
 dates, so a report says which code produced it.")
@@ -8077,25 +8077,25 @@ dealt with, so that catching up on it later clears the whole thread.
 Gmail itself has no such rule; labels are per message."
   :type '(repeat string))
 
-(defcustom nngmail-thread-labels-spread 'gnus
-  "Whether, and how far, a thread label spreads when a summary is built.
+(defcustom nngmail-thread-labels-spread '(gnus)
+  "How far a thread label spreads when a summary is built: a list of reaches.
 A label in `nngmail-thread-labels' may land on one message only: a
 Gmail filter put it there, or you did with `L +' in another group.
-On entering any nngmail group, every Gnus thread shown there whose
-member carries such a label gets the label on all its members, so that
+On entering any nngmail group, every thread shown there whose member
+carries such a label gets the label on all its members, so that
 catching up on the label's group clears the whole conversation.
 
-nil      never.
 `gnus'   the Gnus thread as displayed (References, with retitled
-         messages kept together per `gnus-thread-operation-ignore-subject').
+         messages kept together by your gathering function).
          Phabricator and other robots that cite a never-delivered parent
          thread correctly this way and not by Gmail's conversation.
-`gmail'  the Gnus thread and, in addition, the Gmail conversation of
-         each labelled member (`threads.get', once per conversation per
-         session), which also reaches messages not shown in this group."
-  :type '(choice (const :tag "Never" nil)
-                 (const :tag "The Gnus thread" gnus)
-                 (const :tag "The Gnus thread and the Gmail conversation" gmail)))
+`gmail'  the Gmail conversation of each labelled member (`threads.get',
+         once per conversation per session), which also reaches messages
+         not shown in this group.
+
+Both may be given; nil turns the spreading off."
+  :type '(set (const :tag "The Gnus thread as displayed" gnus)
+              (const :tag "The Gmail conversation" gmail)))
 
 (defvar nngmail--spread-seen (make-hash-table :test #'equal)
   "(LABEL . THREAD-ID) pairs whose Gmail conversation was spread this session.")
@@ -8126,14 +8126,18 @@ See `nngmail-thread-labels-spread'.  Runs from `gnus-summary-prepared-hook'."
                                    (mapcar #'car (nngmail-account-label-names account))))
            (adds nil)                    ; (LABEL . NUMS) to add
            (touched nil))
-      (dolist (thread (nngmail--summary-gnus-threads))
+      ;; Without `gnus', each shown message is its own "thread": the
+      ;; Gmail conversation then decides the reach alone.
+      (dolist (thread (if (memq 'gnus nngmail-thread-labels-spread)
+                          (nngmail--summary-gnus-threads)
+                        (mapcar #'list gnus-newsgroup-articles)))
         (let ((nums (delq nil (mapcar (lambda (l) (nngmail--local->num account group l)) thread))))
           (dolist (label thread-ids)
             (let ((having (seq-filter (lambda (n) (member label (gethash n labels))) nums)))
               (when having
                 (let ((members nums))
                   ;; the Gmail conversation of each labelled member, once per session
-                  (when (eq nngmail-thread-labels-spread 'gmail)
+                  (when (memq 'gmail nngmail-thread-labels-spread)
                     (dolist (num having)
                       (when-let* ((h (nngmail--header account num))
                                   (tid (cdr (assq 'X-Gmail-Thread-Id (mail-header-extra h))))

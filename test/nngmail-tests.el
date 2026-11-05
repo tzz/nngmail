@@ -2599,7 +2599,7 @@ that has it on one member; with `gmail', over the Gmail conversation too."
             (gnus-summary-mode)
             (setq gnus-newsgroup-name "nngmail+test:INBOX")
             ;; gnus: a and c get it; d (other thread) and e (not shown) do not
-            (let ((nngmail-thread-labels-spread 'gnus))
+            (let ((nngmail-thread-labels-spread '(gnus)))
               (nngmail--spread-thread-labels))
             (let ((body (nth 3 (car nngmail-test--calls))))
               (should (equal '("a" "c") (sort (append (alist-get 'ids body) nil) #'string<)))
@@ -2607,11 +2607,11 @@ that has it on one member; with `gmail', over the Gmail conversation too."
             (dolist (n '(1 2 3)) (should (member "Label_9" (gethash n (nngmail-account-labels a)))))
             (dolist (n '(4 5)) (should-not (member "Label_9" (gethash n (nngmail-account-labels a)))))
             ;; nothing left to do: no request
-            (let ((before (length nngmail-test--calls)) (nngmail-thread-labels-spread 'gnus))
+            (let ((before (length nngmail-test--calls)) (nngmail-thread-labels-spread '(gnus)))
               (nngmail--spread-thread-labels)
               (should (= before (length nngmail-test--calls))))
             ;; gmail: the conversation brings in e, once per session
-            (let ((nngmail-thread-labels-spread 'gmail))
+            (let ((nngmail-thread-labels-spread '(gnus gmail)))
               (nngmail--spread-thread-labels)
               (should (member "Label_9" (gethash 5 (nngmail-account-labels a))))
               (let ((before (length nngmail-test--calls)))
