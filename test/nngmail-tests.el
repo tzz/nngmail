@@ -2624,6 +2624,52 @@ that has it on one member; with `gmail', over the Gmail conversation too."
               (nngmail--propagate-thread-labels)
               (should-not nngmail-test--calls))))))))
 
+(ert-deftest nngmail-test-thread-labels-propagate-from-history ()
+  "A thread label that appears on one message through history reaches its
+Gmail conversation when the pass ends, with no summary buffer involved."
+  (nngmail-test-with-mock
+      `(("POST messages/batchModify" . ((ok . t)))
+        ("GET threads/T1" . ((id . "T1") (messages . (((id . "a")) ((id . "b")) ((id . "c")))))))
+    (let ((a (nngmail-test--account))
+          (nngmail-thread-labels '("done"))
+          (nngmail-thread-labels-propagate '(gnus gmail))
+          (nngmail--propagated-seen (make-hash-table :test #'equal))
+          (nngmail--propagate-queue nil))
+      (setf (nngmail-account-label-names a) '(("INBOX" . "INBOX") ("Label_9" . "done")))
+      (nngmail--rebuild-name-map a)
+      (nngmail--with-transaction a
+        (pcase-dolist (`(,num ,id ,tid) '((1 "a" "T1") (2 "b" "T1") (3 "c" "T1") (4 "d" "T2")))
+          (puthash id num (nngmail-account-id->num a))
+          (puthash num id (nngmail-account-num->id a))
+          (nngmail--store-header a num (make-full-mail-header num "s" "f" "d" (format "<%s@x>" id) "" 1 0 nil
+                                                              `((X-Gmail-Thread-Id . ,tid)))
+                                 '("INBOX"))))
+      (nngmail--rebuild-groups a)
+      ;; history says: b now carries done (a filter did it); d changed too, no thread label
+      (nngmail--apply-history
+       a '((id . "7")
+           (labelsAdded . (((message . ((id . "b") (labelIds . ("INBOX" "Label_9"))))
+                            (labelIds . ("Label_9")))))
+           (messages . (((id . "b") (labelIds . ("INBOX" "Label_9")))
+                        ((id . "d") (labelIds . ("INBOX" "Label_1")))))))
+      (should (equal '(("Label_9" . 2)) (alist-get a nngmail--propagate-queue)))
+      ;; nothing sent yet
+      (should-not (seq-find (lambda (c) (equal (nth 1 c) "messages/batchModify")) nngmail-test--calls))
+      ;; end of pass
+      (should (= 2 (nngmail--propagate-queued a)))
+      (let ((body (nth 3 (seq-find (lambda (c) (equal (nth 1 c) "messages/batchModify")) nngmail-test--calls))))
+        (should (equal '("a" "c") (sort (append (alist-get 'ids body) nil) #'string<)))
+        (should (equal ["Label_9"] (alist-get 'addLabelIds body))))
+      (dolist (n '(1 2 3)) (should (member "Label_9" (gethash n (nngmail-account-labels a)))))
+      (should-not (member "Label_9" (gethash 4 (nngmail-account-labels a))))
+      ;; queue drained; the propagation itself did not re-queue a and c
+      (should-not (alist-get a nngmail--propagate-queue))
+      (should (= 0 (nngmail--propagate-queued a)))
+      ;; without gmail in the option nothing is queued
+      (let ((nngmail-thread-labels-propagate '(gnus)))
+        (nngmail--set-labels a 4 '("INBOX" "Label_9"))
+        (should-not (alist-get a nngmail--propagate-queue))))))
+
 (ert-deftest nngmail-test-refresh-summary-lines-redraws-text ()
   "After a label edit the summary line's text changes, not only its marks.
 `gnus-summary-update-line' redoes marks and faces; the label cell is

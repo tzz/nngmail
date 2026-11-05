@@ -3,7 +3,7 @@
 ;; Copyright (C) 2026 Teodor Zlatanov
 
 ;; Author: Teodor Zlatanov <tzz@lifelogs.com>
-;; Version: 1.2.3
+;; Version: 1.3.0
 ;; Package-Requires: ((emacs "29.1") (oauth2 "0.19"))
 ;; Emacs must be built with SQLite (--with-sqlite3); see `nngmail--require-sqlite'.
 ;; Keywords: mail, news, gnus
@@ -293,7 +293,7 @@ Defaults to the nngmail server name.")
   db                  ; open sqlite object, see "Persistence"
   header-lru)         ; list of article numbers, most recently used first
 
-(defconst nngmail-version "1.2.3"
+(defconst nngmail-version "1.3.0"
   "The nngmail code version.  Bump on every change that a test drive can see.
 `nngmail-build-info' (nngmail-reload.el) prints it with the source
 dates, so a report says which code produced it.")
@@ -4352,6 +4352,12 @@ Writes the row to the database and updates group membership.  Under
       (puthash num labels (nngmail-account-labels account))
     (nngmail--set-labels-1 account num labels)))
 
+(defvar nngmail--propagate-queue)        ; defined with the propagation code below
+(defvar nngmail--propagating nil
+  "Non-nil while `nngmail--propagate-queued' writes, so its own edits do not queue.")
+(defvar nngmail-thread-labels)
+(defvar nngmail-thread-labels-propagate)
+
 (defvar nngmail--touched-groups 'off
   "When a list is bound here, groups whose membership changed are pushed to it.
 The background job binds it around a pass and refreshes those *Group*
@@ -4364,6 +4370,14 @@ ACCOUNT is the nngmail account."
          (old-groups (and old (nngmail--message-groups account old)))
          (new-groups (nngmail--message-groups account labels)))
     (puthash num labels (nngmail-account-labels account))
+    ;; A thread label that just appeared on this message (a Gmail filter,
+    ;; another client, or us) is owed to the rest of its conversation;
+    ;; `nngmail--propagate-queued' pays at the end of the pass.
+    (when (and nngmail-thread-labels (memq 'gmail nngmail-thread-labels-propagate)
+               (not nngmail--propagating))
+      (dolist (l labels)
+        (when (and (not (member l old)) (nngmail--thread-label-p account l))
+          (cl-pushnew (cons l num) (alist-get account nngmail--propagate-queue) :test #'equal))))
     (dolist (g old-groups)
       (unless (member g new-groups)
         (nngmail--group-remove account g num)
@@ -6813,7 +6827,10 @@ Use after Gmail has been generous for a while, or to retest the defaults."
 Return non-nil on success.  Whatever was indexed before the error is
 kept, so Gnus can still show the groups from local state."
   (condition-case err
-      (progn (nngmail--incremental-sync account) t)
+      (progn (nngmail--incremental-sync account)
+             ;; labels that appeared during the pass go to their conversations
+             (nngmail--propagate-queued account)
+             t)
     (nngmail-aborted
      (nngmail--save account)
      (nngmail--message 5 "%s: sync aborted; %d messages still to fetch, will resume on next sync"
@@ -8100,6 +8117,49 @@ Both may be given; nil turns the propagation off."
 (defvar nngmail--propagated-seen (make-hash-table :test #'equal)
   "(LABEL . THREAD-ID) pairs whose Gmail conversation was propagated to this session.")
 
+(defvar nngmail--propagate-queue nil
+  "Alist ACCOUNT -> list of (LABEL . NUM): thread labels that appeared.
+Filled by `nngmail--set-labels-1' as labels change (any source: history,
+a sync, a manual edit); drained by `nngmail--propagate-queued' at the end
+of a pass, which labels the rest of each Gmail conversation.  Nothing
+here touches the network.")
+
+(defun nngmail--conversation-members (account label num)
+  "Server numbers of NUM's Gmail conversation, fetched once per LABEL per session.
+Returns nil when NUM has no thread id or the conversation was already
+looked up for LABEL (`nngmail--propagated-seen').  ACCOUNT is the
+nngmail account."
+  (when-let* ((h (nngmail--header account num))
+              (tid (cdr (assq 'X-Gmail-Thread-Id (mail-header-extra h))))
+              ((not (string-empty-p tid)))
+              ((not (gethash (cons label tid) nngmail--propagated-seen))))
+    (puthash (cons label tid) t nngmail--propagated-seen)
+    (let* ((thread (nngmail--get account (concat "threads/" tid) '(("format" . "minimal"))))
+           (ids (mapcar (lambda (m) (alist-get 'id m)) (alist-get 'messages thread))))
+      (nngmail--fetch-metadata account ids "thread"))))
+
+(defun nngmail--propagate-queued (account)
+  "Give queued thread labels of ACCOUNT to the rest of each Gmail conversation.
+See `nngmail--propagate-queue'.  Runs at the end of a sync pass, so a
+label a Gmail filter put on one message reaches the conversation without
+anyone entering a group.  Returns the number of messages labelled."
+  (let ((queued (alist-get account nngmail--propagate-queue))
+        (labels (nngmail-account-labels account))
+        (adds nil))
+    (setf (alist-get account nngmail--propagate-queue nil t) nil)
+    (pcase-dolist (`(,label . ,num) queued)
+      (dolist (member (nngmail--conversation-members account label num))
+        (unless (member label (gethash member labels))
+          (cl-pushnew member (alist-get label adds nil nil #'equal)))))
+    (let ((count 0) (nngmail--propagating t))
+      (pcase-dolist (`(,label . ,nums) adds)
+        (nngmail--modify account nums (list label) nil)
+        (cl-incf count (length nums))
+        (nngmail--log "%s: %s propagated to %d message%s (conversation)"
+                      (nngmail-account-name account) (nngmail--label-group account label)
+                      (length nums) (if (= 1 (length nums)) "" "s")))
+      count)))
+
 (defun nngmail--summary-gnus-threads ()
   "The displayed threads of this summary: a list of lists of local numbers.
 Read from `gnus-newsgroup-data', in display order: a thread is a
@@ -8139,15 +8199,7 @@ See `nngmail-thread-labels-propagate'.  Runs from `gnus-summary-prepared-hook'."
                   ;; the Gmail conversation of each labelled member, once per session
                   (when (memq 'gmail nngmail-thread-labels-propagate)
                     (dolist (num having)
-                      (when-let* ((h (nngmail--header account num))
-                                  (tid (cdr (assq 'X-Gmail-Thread-Id (mail-header-extra h))))
-                                  ((not (string-empty-p tid)))
-                                  ((not (gethash (cons label tid) nngmail--propagated-seen))))
-                        (puthash (cons label tid) t nngmail--propagated-seen)
-                        (let* ((thread (nngmail--get account (concat "threads/" tid)
-                                                     '(("format" . "minimal"))))
-                               (ids (mapcar (lambda (m) (alist-get 'id m)) (alist-get 'messages thread))))
-                          (setq members (append members (nngmail--fetch-metadata account ids "thread")))))))
+                      (setq members (append members (nngmail--conversation-members account label num)))))
                   (dolist (num (seq-uniq members))
                     (unless (member label (gethash num labels))
                       (push num (alist-get label adds nil nil #'equal))

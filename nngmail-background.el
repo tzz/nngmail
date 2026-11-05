@@ -320,7 +320,15 @@ little early is harmless since the request itself is metered again."
     (setf (nngmail-job-touched job) nil)))
 
 (defun nngmail--job-idle (job)
-  "Put JOB to sleep until the next poll."
+  "Put JOB to sleep until the next poll.
+Thread labels the pass saw appear are first given to their Gmail
+conversations (`nngmail--propagate-queued'); this is the moment a
+filter's label reaches the whole thread without anyone entering a group."
+  (let ((account (nngmail-job-account job)))
+    (condition-case err
+        (nngmail--propagate-queued account)
+      (error (nngmail--log "%s: propagation failed: %s" (nngmail-account-name account)
+                           (error-message-string err)))))
   (nngmail--job-refresh-group-lines job)
   (let ((account (nngmail-job-account job)))
     (setf (nngmail-job-state job) 'idle
