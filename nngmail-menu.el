@@ -86,6 +86,7 @@
     ("+" "add a label" nngmail-summary-add-label)
     ("-" "remove a label" nngmail-summary-remove-label)
     ("a" "archive (drop INBOX)" nngmail-summary-archive)
+    ("t" "label the whole thread" nngmail-summary-label-thread)
     ("l" "show labels" nngmail-summary-show-labels)
     ("?" "explain icons" nngmail-summary-explain-labels)
     ("D" "linked Google Docs" nngmail-gdocs-show)]

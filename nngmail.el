@@ -3,7 +3,7 @@
 ;; Copyright (C) 2026 Teodor Zlatanov
 
 ;; Author: Teodor Zlatanov <tzz@lifelogs.com>
-;; Version: 1.0.0
+;; Version: 1.1.0
 ;; Package-Requires: ((emacs "29.1") (oauth2 "0.19"))
 ;; Emacs must be built with SQLite (--with-sqlite3); see `nngmail--require-sqlite'.
 ;; Keywords: mail, news, gnus
@@ -293,7 +293,7 @@ Defaults to the nngmail server name.")
   db                  ; open sqlite object, see "Persistence"
   header-lru)         ; list of article numbers, most recently used first
 
-(defconst nngmail-version "1.0.0"
+(defconst nngmail-version "1.1.0"
   "The nngmail code version.  Bump on every change that a test drive can see.
 `nngmail-build-info' (nngmail-reload.el) prints it with the source
 dates, so a report says which code produced it.")
@@ -8067,13 +8067,65 @@ ACCOUNT is the nngmail account."
                  'nngmail-label-history)))
     (delq nil (mapcar (lambda (n) (cdr (assoc (string-trim n) choices))) names))))
 
+(defcustom nngmail-thread-labels nil
+  "Labels that apply to a whole Gmail conversation at once.
+A list of label ids or display names (\"dev/done\", \"Label_12\").
+Adding or removing one of these on a message, with the `L' commands,
+also adds or removes it on every other message of that Gmail thread,
+in any group.  The use: a \"done\" label that marks a conversation as
+dealt with, so that catching up on it later clears the whole thread.
+Gmail itself has no such rule; labels are per message."
+  :type '(repeat string))
+
+(defun nngmail--thread-label-p (account label)
+  "Whether LABEL (an id) is one of `nngmail-thread-labels' in ACCOUNT."
+  (or (member label nngmail-thread-labels)
+      (member (nngmail--label-group account label) nngmail-thread-labels)))
+
+(defun nngmail--thread-nums (account nums)
+  "Server numbers of every message in the Gmail threads of NUMS, NUMS included.
+One `threads.get' per distinct thread; members not indexed yet are
+fetched.  ACCOUNT is the nngmail account."
+  (let ((threads nil) (all nil))
+    (dolist (num nums)
+      (let ((tid (and (nngmail--header account num)
+                      (cdr (assq 'X-Gmail-Thread-Id
+                                 (mail-header-extra (nngmail--header account num)))))))
+        (if (and tid (not (string-empty-p tid)))
+            (cl-pushnew tid threads :test #'equal)
+          (push num all))))
+    (dolist (tid threads)
+      (let* ((thread (nngmail--get account (concat "threads/" tid) '(("format" . "minimal"))))
+             (ids (mapcar (lambda (m) (alist-get 'id m)) (alist-get 'messages thread))))
+        (setq all (append (nngmail--fetch-metadata account ids "thread") all))))
+    (seq-uniq (append nums all))))
+
 (defun nngmail--apply-label-edit (account group nums add remove)
   "Do ADD/REMOVE on NUMS of GROUP, refresh the summary lines, announce the effects.
-ACCOUNT is the nngmail account."
+A label in `nngmail-thread-labels' is applied to the whole Gmail thread
+of each message.  ACCOUNT is the nngmail account."
   (when (or add remove)
-    (nngmail--modify account nums add remove)
-    (nngmail--refresh-summary-lines account group nums)
-    (nngmail--announce-label-edit account group nums add remove)))
+    (let* ((thread-wide (seq-filter (lambda (l) (nngmail--thread-label-p account l))
+                                    (append add remove)))
+           (targets (if thread-wide (nngmail--thread-nums account nums) nums)))
+      (nngmail--modify account targets add remove)
+      (nngmail--refresh-summary-lines account group targets)
+      (nngmail--announce-label-edit account group targets add remove))))
+
+;;;###autoload
+(defun nngmail-summary-label-thread (label)
+  "Add LABEL to every message of the Gmail thread of the article at point.
+With process-marked articles, each of their threads.  Whatever
+`nngmail-thread-labels' says; this command is always thread-wide."
+  (interactive
+   (pcase-let ((`(,account ,_ ,_) (nngmail--summary-context)))
+     (list (car (nngmail--read-labels account "Label the whole thread with: ")))))
+  (pcase-let ((`(,account ,group ,nums) (nngmail--summary-context)))
+    (unless label (user-error "nngmail: No label chosen"))
+    (let ((targets (nngmail--thread-nums account nums)))
+      (nngmail--modify account targets (list label) nil)
+      (nngmail--refresh-summary-lines account group targets)
+      (nngmail--announce-label-edit account group targets (list label) nil))))
 
 (defun nngmail--refresh-summary-lines (account group nums)
   "Redraw the summary lines of server articles NUMS of GROUP.
@@ -8172,6 +8224,7 @@ other labels and stays in All Mail."
     (define-key map "+" #'nngmail-summary-add-label)
     (define-key map "-" #'nngmail-summary-remove-label)
     (define-key map "a" #'nngmail-summary-archive)
+    (define-key map "t" #'nngmail-summary-label-thread)
     (define-key map "l" #'nngmail-summary-show-labels)
     (define-key map "?" #'nngmail-summary-explain-labels)
     map)

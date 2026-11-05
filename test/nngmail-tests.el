@@ -2515,6 +2515,56 @@ no Bcc, body intact."
         (should (string-match-p "\n\nbody line\n\\'" raw))))))
 
 
+(ert-deftest nngmail-test-thread-labels ()
+  "A label in `nngmail-thread-labels' goes to the whole Gmail thread; others
+stay on the message.  `L t' is thread-wide for any label."
+  (nngmail-test-with-mock
+      `(("POST messages/batchModify" . ((ok . t)))
+        ("GET threads/T1" . ((id . "T1") (messages . (((id . "a")) ((id . "b")) ((id . "c")))))))
+    (let ((a (nngmail-test--account))
+          (nngmail-thread-labels '("done"))   ; by display name
+          (gnus-newsrc-alist nil) (gnus-newsrc-hashtb nil))
+      (setf (nngmail-account-label-names a)
+            '(("INBOX" . "INBOX") ("Label_1" . "work") ("Label_9" . "done")))
+      (nngmail--rebuild-name-map a)
+      ;; three messages of one thread (a b c), one of another (d)
+      (nngmail--with-transaction a
+        (pcase-dolist (`(,num ,id ,tid) '((1 "a" "T1") (2 "b" "T1") (3 "c" "T1") (4 "d" "T2")))
+          (puthash id num (nngmail-account-id->num a))
+          (puthash num id (nngmail-account-num->id a))
+          (nngmail--store-header a num (make-full-mail-header num "s" "f" "d" (format "<%s@x>" id) "" 1 0 nil
+                                                              `((X-Gmail-Thread-Id . ,tid)))
+                                 '("INBOX"))))
+      (nngmail--rebuild-groups a)
+      (setq gnus-newsrc-alist (list (list "nngmail+test:INBOX" 4 nil nil (list 'nngmail "test"))))
+      (gnus-make-hashtable-from-newsrc-alist)
+      (should (nngmail--thread-label-p a "Label_9"))
+      (should-not (nngmail--thread-label-p a "Label_1"))
+      (with-temp-buffer
+        (gnus-summary-mode)
+        (setq gnus-newsgroup-name "nngmail+test:INBOX")
+        (cl-letf (((symbol-function 'gnus-summary-work-articles)
+                   (lambda (&rest _) (list (nngmail--num->local a "INBOX" 2))))
+                  ((symbol-function 'nngmail--refresh-summary-lines) #'ignore))
+          ;; a plain label: only message b
+          (nngmail-summary-add-label "Label_1")
+          (let ((body (nth 3 (car nngmail-test--calls))))
+            (should (equal ["b"] (alist-get 'ids body))))
+          ;; the thread label: a, b and c, found through threads.get
+          (nngmail-summary-add-label "Label_9")
+          (let ((body (nth 3 (car nngmail-test--calls))))
+            (should (equal '("a" "b" "c") (sort (append (alist-get 'ids body) nil) #'string<)))
+            (should (equal ["Label_9"] (alist-get 'addLabelIds body))))
+          (dolist (n '(1 2 3)) (should (member "Label_9" (gethash n (nngmail-account-labels a)))))
+          (should-not (member "Label_9" (gethash 4 (nngmail-account-labels a))))
+          ;; removing it is thread-wide too
+          (nngmail-summary-remove-label "Label_9")
+          (dolist (n '(1 2 3)) (should-not (member "Label_9" (gethash n (nngmail-account-labels a)))))
+          ;; L t: any label, whole thread
+          (nngmail-summary-label-thread "Label_1")
+          (dolist (n '(1 2 3)) (should (member "Label_1" (gethash n (nngmail-account-labels a)))))
+          (should-not (member "Label_1" (gethash 4 (nngmail-account-labels a)))))))))
+
 (ert-deftest nngmail-test-summary-label-commands ()
   "Edit/add/remove/archive send exactly the label difference to Gmail, work
 on process-marked articles, and leave other labels alone."

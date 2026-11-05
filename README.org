@@ -471,6 +471,23 @@ goes to =*Messages*= or the log; the log gets one line per phase change
 (with the total), one when a phase of 5 s or more finishes (with how
 long it took), and one per pause.
 
+* Labels that cover a conversation
+
+Gmail labels are per message.  =nngmail-thread-labels= names labels (ids
+or display names) that nngmail applies to the whole Gmail thread
+instead: adding or removing one of them with the =L= commands on any
+message also adds or removes it on every other message of that
+conversation, in any group.  A "done" label works that way: file one
+reply under it and the whole thread is filed; catch up on the =done=
+group later and the thread is cleared.
+
+#+begin_src emacs-lisp
+(setq nngmail-thread-labels '("dev/done"))
+#+end_src
+
+=L t= labels the whole thread with any label, once, whatever the option
+says.
+
 * Showing a message's other labels
 
 A message can carry several labels, so it appears in several groups.
