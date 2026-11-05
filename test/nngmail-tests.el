@@ -2565,15 +2565,15 @@ stay on the message.  `L t' is thread-wide for any label."
           (dolist (n '(1 2 3)) (should (member "Label_1" (gethash n (nngmail-account-labels a)))))
           (should-not (member "Label_1" (gethash 4 (nngmail-account-labels a)))))))))
 
-(ert-deftest nngmail-test-thread-labels-spread-on-entry ()
-  "Building a summary spreads a thread label over each displayed Gnus thread
+(ert-deftest nngmail-test-thread-labels-propagate-on-entry ()
+  "Building a summary propagates a thread label over each displayed Gnus thread
 that has it on one member; with `gmail', over the Gmail conversation too."
   (nngmail-test-with-mock
       `(("POST messages/batchModify" . ((ok . t)))
         ("GET threads/T1" . ((id . "T1") (messages . (((id . "a")) ((id . "b")) ((id . "c")) ((id . "e")))))))
     (let ((a (nngmail-test--account))
           (nngmail-thread-labels '("done"))
-          (nngmail--spread-seen (make-hash-table :test #'equal))
+          (nngmail--propagated-seen (make-hash-table :test #'equal))
           (gnus-newsrc-alist nil) (gnus-newsrc-hashtb nil))
       (setf (nngmail-account-label-names a) '(("INBOX" . "INBOX") ("Label_9" . "done")))
       (nngmail--rebuild-name-map a)
@@ -2599,30 +2599,65 @@ that has it on one member; with `gmail', over the Gmail conversation too."
             (gnus-summary-mode)
             (setq gnus-newsgroup-name "nngmail+test:INBOX")
             ;; gnus: a and c get it; d (other thread) and e (not shown) do not
-            (let ((nngmail-thread-labels-spread '(gnus)))
-              (nngmail--spread-thread-labels))
+            (let ((nngmail-thread-labels-propagate '(gnus)))
+              (nngmail--propagate-thread-labels))
             (let ((body (nth 3 (car nngmail-test--calls))))
               (should (equal '("a" "c") (sort (append (alist-get 'ids body) nil) #'string<)))
               (should (equal ["Label_9"] (alist-get 'addLabelIds body))))
             (dolist (n '(1 2 3)) (should (member "Label_9" (gethash n (nngmail-account-labels a)))))
             (dolist (n '(4 5)) (should-not (member "Label_9" (gethash n (nngmail-account-labels a)))))
             ;; nothing left to do: no request
-            (let ((before (length nngmail-test--calls)) (nngmail-thread-labels-spread '(gnus)))
-              (nngmail--spread-thread-labels)
+            (let ((before (length nngmail-test--calls)) (nngmail-thread-labels-propagate '(gnus)))
+              (nngmail--propagate-thread-labels)
               (should (= before (length nngmail-test--calls))))
             ;; gmail: the conversation brings in e, once per session
-            (let ((nngmail-thread-labels-spread '(gnus gmail)))
-              (nngmail--spread-thread-labels)
+            (let ((nngmail-thread-labels-propagate '(gnus gmail)))
+              (nngmail--propagate-thread-labels)
               (should (member "Label_9" (gethash 5 (nngmail-account-labels a))))
               (let ((before (length nngmail-test--calls)))
-                (nngmail--spread-thread-labels)
+                (nngmail--propagate-thread-labels)
                 (should (= before (length nngmail-test--calls)))))
             ;; nil: off
             (setq nngmail-test--calls nil)
             (nngmail--set-labels a 1 '("INBOX"))
-            (let ((nngmail-thread-labels-spread nil))
-              (nngmail--spread-thread-labels)
+            (let ((nngmail-thread-labels-propagate nil))
+              (nngmail--propagate-thread-labels)
               (should-not nngmail-test--calls))))))))
+
+(ert-deftest nngmail-test-refresh-summary-lines-redraws-text ()
+  "After a label edit the summary line's text changes, not only its marks.
+`gnus-summary-update-line' redoes marks and faces; the label cell is
+text rendered from the header, so the line must be re-inserted."
+  (nngmail-test-with-mock
+      `(("POST messages/batchModify" . ((ok . t))))
+    (let ((a (nngmail-test--account))
+          (gnus-newsrc-alist nil) (gnus-newsrc-hashtb nil))
+      (setf (nngmail-account-label-names a) '(("INBOX" . "INBOX") ("Label_9" . "done")))
+      (nngmail--rebuild-name-map a)
+      (nngmail-test--seed a '((1 "a" ("INBOX"))))
+      (setq gnus-newsrc-alist (list (list "nngmail+test:INBOX" 1 nil nil (list 'nngmail "test"))))
+      (gnus-make-hashtable-from-newsrc-alist)
+      (with-temp-buffer
+        (gnus-summary-mode)
+        (let* ((h (copy-sequence (nngmail--header a 1)))
+               (gnus-newsgroup-name "nngmail+test:INBOX")
+               (gnus-show-threads t)
+               (gnus-summary-line-format "%U%R [%u&gmail-labels;] %s\n")
+               (gnus-newsgroup-headers (progn (setf (mail-header-number h) 1) (list h)))
+               (gnus-newsgroup-unreads '(1)) (gnus-newsgroup-limit '(1)) (gnus-newsgroup-articles '(1))
+               (gnus-newsgroup-data nil)
+               (gnus-newsgroup-dependencies (gnus-make-hashtable 20))
+               (gnus-summary-highlight nil) (gnus-build-sparse-threads nil) (gnus-fetch-old-headers nil)
+               (nngmail-status-bar nil))
+          (cl-letf (((symbol-function 'nngmail--svg-p) (lambda () nil)))
+            (gnus-dependencies-add-header h gnus-newsgroup-dependencies nil)
+            ;; Gnus compiles the line format on group entry; do it here.
+            (gnus-update-format-specifications t 'summary)
+            (gnus-summary-prepare)
+            (should (string-match-p "\\[\\] s" (buffer-string)))
+            (nngmail--modify a '(1) '("Label_9") nil)
+            (nngmail--refresh-summary-lines a "INBOX" '(1))
+            (should (string-match-p "\\[done\\] s" (buffer-string)))))))))
 
 (ert-deftest nngmail-test-summary-gnus-threads ()
   "The thread walker returns each displayed Gnus thread's articles.
@@ -2634,6 +2669,7 @@ second with a retitled reply under a never-delivered root) and a loner."
                  (make-full-mail-header n subj "f" "Mon, 01 Sep 2026 10:00:00 +0000" id refs 1 0 nil nil)))
            (gnus-newsgroup-name "nngmail+test:INBOX")
            (gnus-show-threads t)
+           (gnus-summary-line-format "%U%R %s\n")
            (gnus-summary-thread-gathering-function #'gnus-gather-threads-by-references)
            (gnus-newsgroup-headers
             (list (funcall mk 1 "one" "<1@x>" "")
@@ -2648,6 +2684,7 @@ second with a retitled reply under a never-delivered root) and a loner."
            (gnus-newsgroup-dependencies (gnus-make-hashtable 20))
            (gnus-summary-highlight nil) (gnus-build-sparse-threads nil) (gnus-fetch-old-headers nil))
       (dolist (h gnus-newsgroup-headers) (gnus-dependencies-add-header h gnus-newsgroup-dependencies nil))
+      (gnus-update-format-specifications t 'summary)
       (gnus-summary-prepare)
       (should (equal '((1 2) (3 4) (5))
                      (mapcar (lambda (th) (sort (copy-sequence th) #'<))

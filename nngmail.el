@@ -3,7 +3,7 @@
 ;; Copyright (C) 2026 Teodor Zlatanov
 
 ;; Author: Teodor Zlatanov <tzz@lifelogs.com>
-;; Version: 1.2.1
+;; Version: 1.2.3
 ;; Package-Requires: ((emacs "29.1") (oauth2 "0.19"))
 ;; Emacs must be built with SQLite (--with-sqlite3); see `nngmail--require-sqlite'.
 ;; Keywords: mail, news, gnus
@@ -293,7 +293,7 @@ Defaults to the nngmail server name.")
   db                  ; open sqlite object, see "Persistence"
   header-lru)         ; list of article numbers, most recently used first
 
-(defconst nngmail-version "1.2.1"
+(defconst nngmail-version "1.2.3"
   "The nngmail code version.  Bump on every change that a test drive can see.
 `nngmail-build-info' (nngmail-reload.el) prints it with the source
 dates, so a report says which code produced it.")
@@ -8077,8 +8077,8 @@ dealt with, so that catching up on it later clears the whole thread.
 Gmail itself has no such rule; labels are per message."
   :type '(repeat string))
 
-(defcustom nngmail-thread-labels-spread '(gnus)
-  "How far a thread label spreads when a summary is built: a list of reaches.
+(defcustom nngmail-thread-labels-propagate '(gnus)
+  "How far a thread label propagates when a summary is built: a list of reaches.
 A label in `nngmail-thread-labels' may land on one message only: a
 Gmail filter put it there, or you did with `L +' in another group.
 On entering any nngmail group, every thread shown there whose member
@@ -8093,12 +8093,12 @@ catching up on the label's group clears the whole conversation.
          once per conversation per session), which also reaches messages
          not shown in this group.
 
-Both may be given; nil turns the spreading off."
+Both may be given; nil turns the propagation off."
   :type '(set (const :tag "The Gnus thread as displayed" gnus)
               (const :tag "The Gmail conversation" gmail)))
 
-(defvar nngmail--spread-seen (make-hash-table :test #'equal)
-  "(LABEL . THREAD-ID) pairs whose Gmail conversation was spread this session.")
+(defvar nngmail--propagated-seen (make-hash-table :test #'equal)
+  "(LABEL . THREAD-ID) pairs whose Gmail conversation was propagated to this session.")
 
 (defun nngmail--summary-gnus-threads ()
   "The displayed threads of this summary: a list of lists of local numbers.
@@ -8114,10 +8114,10 @@ built it (References, plus the gathering function's work)."
     (when current (push (nreverse current) threads))
     (nreverse threads)))
 
-(defun nngmail--spread-thread-labels ()
-  "Spread each thread label from the member that has it to its whole thread.
-See `nngmail-thread-labels-spread'.  Runs from `gnus-summary-prepared-hook'."
-  (when-let* ((nngmail-thread-labels-spread)
+(defun nngmail--propagate-thread-labels ()
+  "Propagate each thread label from the member that has it to its whole thread.
+See `nngmail-thread-labels-propagate'.  Runs from `gnus-summary-prepared-hook'."
+  (when-let* ((nngmail-thread-labels-propagate)
               (nngmail-thread-labels)
               (account (nngmail--current-account-for-summary))
               (group (gnus-group-real-name gnus-newsgroup-name)))
@@ -8128,7 +8128,7 @@ See `nngmail-thread-labels-spread'.  Runs from `gnus-summary-prepared-hook'."
            (touched nil))
       ;; Without `gnus', each shown message is its own "thread": the
       ;; Gmail conversation then decides the reach alone.
-      (dolist (thread (if (memq 'gnus nngmail-thread-labels-spread)
+      (dolist (thread (if (memq 'gnus nngmail-thread-labels-propagate)
                           (nngmail--summary-gnus-threads)
                         (mapcar #'list gnus-newsgroup-articles)))
         (let ((nums (delq nil (mapcar (lambda (l) (nngmail--local->num account group l)) thread))))
@@ -8137,13 +8137,13 @@ See `nngmail-thread-labels-spread'.  Runs from `gnus-summary-prepared-hook'."
               (when having
                 (let ((members nums))
                   ;; the Gmail conversation of each labelled member, once per session
-                  (when (memq 'gmail nngmail-thread-labels-spread)
+                  (when (memq 'gmail nngmail-thread-labels-propagate)
                     (dolist (num having)
                       (when-let* ((h (nngmail--header account num))
                                   (tid (cdr (assq 'X-Gmail-Thread-Id (mail-header-extra h))))
                                   ((not (string-empty-p tid)))
-                                  ((not (gethash (cons label tid) nngmail--spread-seen))))
-                        (puthash (cons label tid) t nngmail--spread-seen)
+                                  ((not (gethash (cons label tid) nngmail--propagated-seen))))
+                        (puthash (cons label tid) t nngmail--propagated-seen)
                         (let* ((thread (nngmail--get account (concat "threads/" tid)
                                                      '(("format" . "minimal"))))
                                (ids (mapcar (lambda (m) (alist-get 'id m)) (alist-get 'messages thread))))
@@ -8154,13 +8154,13 @@ See `nngmail-thread-labels-spread'.  Runs from `gnus-summary-prepared-hook'."
                       (push num touched)))))))))
       (pcase-dolist (`(,label . ,nums) adds)
         (nngmail--modify account nums (list label) nil)
-        (nngmail--message 6 "%s: %s spread to %d message%s"
+        (nngmail--message 6 "%s: %s propagated to %d message%s"
                           (nngmail-account-name account) (nngmail--label-group account label)
                           (length nums) (if (= 1 (length nums)) "" "s")))
       (when touched
         (nngmail--refresh-summary-lines account group (seq-uniq touched))))))
 
-(add-hook 'gnus-summary-prepared-hook #'nngmail--spread-thread-labels)
+(add-hook 'gnus-summary-prepared-hook #'nngmail--propagate-thread-labels)
 
 (defun nngmail--thread-label-p (account label)
   "Whether LABEL (an id) is one of `nngmail-thread-labels' in ACCOUNT."
@@ -8227,7 +8227,14 @@ ACCOUNT is the nngmail account."
               (cons h2 (cl-remove local gnus-newsgroup-headers :key #'mail-header-number)))
         (save-excursion
           (when (gnus-summary-goto-subject local t)
-            (gnus-summary-update-line)))))))
+            ;; `gnus-summary-update-line' only redoes marks and highlight;
+            ;; the line text (the label cells) is re-rendered from the
+            ;; header by `gnus-summary-update-article-line', which also
+            ;; puts the new header into Gnus's thread data.  Lines of
+            ;; articles not in any thread (an error there) are skipped.
+            (condition-case nil
+                (gnus-summary-update-article-line local h2)
+              (error (gnus-summary-update-line)))))))))
 
 (defun nngmail--announce-label-edit (account group nums add remove)
   "Say what a label edit on NUMS of GROUP did, naming the groups it touched.
