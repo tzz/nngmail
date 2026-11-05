@@ -503,6 +503,13 @@ pulls in messages not shown in the group; =nil= turns it off.
 (setq nngmail-thread-labels-propagate '(gnus gmail))
 #+end_src
 
+With =gmail= the propagation also runs without any group being entered:
+whenever a sync (the background job or =g=) sees a thread label appear
+on a message, through Gmail's history, the rest of that conversation
+gets the label at the end of the pass.  A filter that files one reply
+under =done= therefore files the whole conversation within one poll
+interval.  Gmail itself has no such rule.
+
 * Showing a message's other labels
 
 A message can carry several labels, so it appears in several groups.
