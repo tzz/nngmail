@@ -3,7 +3,7 @@
 ;; Copyright (C) 2026 Teodor Zlatanov
 
 ;; Author: Teodor Zlatanov <tzz@lifelogs.com>
-;; Version: 1.3.0
+;; Version: 1.3.1
 ;; Package-Requires: ((emacs "29.1") (oauth2 "0.19"))
 ;; Emacs must be built with SQLite (--with-sqlite3); see `nngmail--require-sqlite'.
 ;; Keywords: mail, news, gnus
@@ -293,7 +293,7 @@ Defaults to the nngmail server name.")
   db                  ; open sqlite object, see "Persistence"
   header-lru)         ; list of article numbers, most recently used first
 
-(defconst nngmail-version "1.3.0"
+(defconst nngmail-version "1.3.1"
   "The nngmail code version.  Bump on every change that a test drive can see.
 `nngmail-build-info' (nngmail-reload.el) prints it with the source
 dates, so a report says which code produced it.")
@@ -8266,27 +8266,44 @@ With process-marked articles, each of their threads.  Whatever
 
 (defun nngmail--refresh-summary-lines (account group nums)
   "Redraw the summary lines of server articles NUMS of GROUP.
-Their label columns then update.
-ACCOUNT is the nngmail account."
-  (dolist (num nums)
-    (when-let* ((local (nngmail--num->local account group num))
-                (h (nngmail--header account num)))
-      ;; The stored header's X-Gmail-Labels changed; give Gnus a copy in
-      ;; local numbering and redraw the line.
-      (let ((h2 (copy-sequence h)))
-        (setf (mail-header-number h2) local)
-        (setq gnus-newsgroup-headers
-              (cons h2 (cl-remove local gnus-newsgroup-headers :key #'mail-header-number)))
-        (save-excursion
-          (when (gnus-summary-goto-subject local t)
-            ;; `gnus-summary-update-line' only redoes marks and highlight;
-            ;; the line text (the label cells) is re-rendered from the
-            ;; header by `gnus-summary-update-article-line', which also
-            ;; puts the new header into Gnus's thread data.  Lines of
-            ;; articles not in any thread (an error there) are skipped.
-            (condition-case nil
-                (gnus-summary-update-article-line local h2)
-              (error (gnus-summary-update-line)))))))))
+Their label columns then update.  ACCOUNT is the nngmail account.
+
+Lines are re-inserted from the bottom of the buffer up.
+`gnus-summary-update-article-line' deletes and re-inserts one line and
+then shifts the recorded positions of every line after it by the size
+difference; a second update higher up, done before that shift is
+consistent with the buffer, re-inserts at a stale position and the line
+appears one row off, with another article's indentation and thread
+glyph (seen 2026-11-05 as foreign messages nested under a thread).
+Going bottom-up, every position a later update reads is still valid.
+Only lines the buffer shows are touched: `gnus-summary-goto-subject'
+with FORCE would *insert* an article that is in the group but not in
+the current display (read, limited away, a propagated thread member),
+grafting it under whatever line is above, which is the other way a
+foreign message appeared nested in a thread."
+  (let (todo)
+    (dolist (num nums)
+      (when-let* ((local (nngmail--num->local account group num))
+                  (h (nngmail--header account num))
+                  (data (gnus-data-find local)))
+        ;; The stored header's X-Gmail-Labels changed; give Gnus a copy
+        ;; in local numbering.
+        (let ((h2 (copy-sequence h)))
+          (setf (mail-header-number h2) local)
+          (setq gnus-newsgroup-headers
+                (cons h2 (cl-remove local gnus-newsgroup-headers :key #'mail-header-number)))
+          (push (list (gnus-data-pos data) local h2) todo))))
+    (save-excursion
+      (pcase-dolist (`(,_pos ,local ,h2) (sort todo (lambda (a b) (> (car a) (car b)))))
+        (when (gnus-summary-goto-subject local nil t)
+          ;; `gnus-summary-update-line' only redoes marks and highlight;
+          ;; the line text (the label cells) is re-rendered from the
+          ;; header by `gnus-summary-update-article-line', which also
+          ;; puts the new header into Gnus's thread data.  An article in
+          ;; no thread (an error there) keeps its line.
+          (condition-case nil
+              (gnus-summary-update-article-line local h2)
+            (error (gnus-summary-update-line))))))))
 
 (defun nngmail--announce-label-edit (account group nums add remove)
   "Say what a label edit on NUMS of GROUP did, naming the groups it touched.

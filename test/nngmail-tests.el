@@ -2705,6 +2705,81 @@ text rendered from the header, so the line must be re-inserted."
             (nngmail--refresh-summary-lines a "INBOX" '(1))
             (should (string-match-p "\\[done\\] s" (buffer-string)))))))))
 
+(ert-deftest nngmail-test-refresh-summary-lines-keeps-structure ()
+  "Refreshing several lines at once keeps every line on its own article and level.
+Updating top-down re-inserted lower lines at stale positions, so they
+took another article's indentation (2026-11-05)."
+  (nngmail-test-with-mock
+      `(("POST messages/batchModify" . ((ok . t))))
+    (let ((a (nngmail-test--account))
+          (gnus-newsrc-alist nil) (gnus-newsrc-hashtb nil))
+      (setf (nngmail-account-label-names a) '(("INBOX" . "INBOX") ("Label_9" . "done")))
+      (nngmail--rebuild-name-map a)
+      ;; thread A: 1 <- 2 <- 3 (grows longer when labelled); thread B: 4 <- 5; loner 6
+      (nngmail--with-transaction a
+        (pcase-dolist (`(,num ,id ,refs) '((1 "a" "") (2 "b" "<a@x>") (3 "c" "<a@x> <b@x>")
+                                           (4 "d" "") (5 "e" "<d@x>") (6 "f" "")))
+          (puthash id num (nngmail-account-id->num a))
+          (puthash num id (nngmail-account-num->id a))
+          (nngmail--store-header a num (make-full-mail-header num (concat "s" id) "f" "Mon, 01 Sep 2026 10:00:00 +0000"
+                                                              (format "<%s@x>" id) refs 1 0 nil nil)
+                                 '("INBOX"))))
+      (nngmail--rebuild-groups a)
+      (setq gnus-newsrc-alist (list (list "nngmail+test:INBOX" 6 nil nil (list 'nngmail "test"))))
+      (gnus-make-hashtable-from-newsrc-alist)
+      (with-temp-buffer
+        (gnus-summary-mode)
+        (let* ((locals (mapcar (lambda (n) (nngmail--num->local a "INBOX" n)) '(1 2 3 4 5 6)))
+               (gnus-newsgroup-name "nngmail+test:INBOX")
+               (gnus-show-threads t)
+               (gnus-summary-line-format "%U%R %N %B[%u&gmail-labels;] %s\n")
+               (gnus-newsgroup-headers
+                (mapcar (lambda (n) (let ((h (copy-sequence (nngmail--header a n))))
+                                      (setf (mail-header-number h) (nngmail--num->local a "INBOX" n)) h))
+                        '(1 2 3 4 5 6)))
+               (gnus-newsgroup-unreads locals) (gnus-newsgroup-limit locals) (gnus-newsgroup-articles locals)
+               (gnus-newsgroup-data nil)
+               (gnus-newsgroup-dependencies (gnus-make-hashtable 20))
+               (gnus-summary-highlight nil) (gnus-build-sparse-threads nil) (gnus-fetch-old-headers nil)
+               (gnus-thread-sort-functions '(gnus-thread-sort-by-number))
+               (nngmail-status-bar nil))
+          (cl-letf (((symbol-function 'nngmail--svg-p) (lambda () nil)))
+            (dolist (h gnus-newsgroup-headers) (gnus-dependencies-add-header h gnus-newsgroup-dependencies nil))
+            (gnus-update-format-specifications t 'summary)
+            (gnus-summary-prepare)
+            (let ((snapshot (lambda ()
+                              ;; (article level) per buffer line, in order
+                              (save-excursion
+                                (goto-char (point-min))
+                                (let (rows)
+                                  (while (not (eobp))
+                                    (push (list (gnus-summary-article-number)
+                                                (gnus-summary-thread-level))
+                                          rows)
+                                    (forward-line 1))
+                                  (nreverse rows))))))
+              (let ((before (funcall snapshot)))
+                ;; label 1 and 4 and 5 (two threads, top-down order as given)
+                (nngmail--modify a '(1 4 5) '("Label_9") nil)
+                (nngmail--refresh-summary-lines a "INBOX" '(1 4 5))
+                (should (equal before (funcall snapshot)))
+                ;; an article of the group that is not displayed (limited
+                ;; away) must not be inserted by the refresh
+                (let ((hidden (nngmail--num->local a "INBOX" 6)))
+                  (gnus-summary-limit (remove hidden gnus-newsgroup-limit))
+                  (let ((limited (funcall snapshot)))
+                    (should-not (assq hidden limited))
+                    (nngmail--modify a '(6) '("Label_9") nil)
+                    (nngmail--refresh-summary-lines a "INBOX" '(6 1))
+                    (should (equal limited (funcall snapshot)))))
+                ;; and the text changed where it should
+                (save-excursion
+                  (goto-char (point-min))
+                  (should (search-forward "[done] sa" nil t))
+                  (should (search-forward "[done] sd" nil t))
+                  (should (search-forward "[done] se" nil t)))
+                (should-not (string-match-p "\\[done\\] sb" (buffer-string)))))))))))
+
 (ert-deftest nngmail-test-summary-gnus-threads ()
   "The thread walker returns each displayed Gnus thread's articles.
 Threads are what Gnus builds from the headers: two by References (the
