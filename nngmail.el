@@ -3,7 +3,7 @@
 ;; Copyright (C) 2026 Teodor Zlatanov
 
 ;; Author: Teodor Zlatanov <tzz@lifelogs.com>
-;; Version: 1.3.1
+;; Version: 1.3.2
 ;; Package-Requires: ((emacs "29.1") (oauth2 "0.19"))
 ;; Emacs must be built with SQLite (--with-sqlite3); see `nngmail--require-sqlite'.
 ;; Keywords: mail, news, gnus
@@ -293,7 +293,7 @@ Defaults to the nngmail server name.")
   db                  ; open sqlite object, see "Persistence"
   header-lru)         ; list of article numbers, most recently used first
 
-(defconst nngmail-version "1.3.1"
+(defconst nngmail-version "1.3.2"
   "The nngmail code version.  Bump on every change that a test drive can see.
 `nngmail-build-info' (nngmail-reload.el) prints it with the source
 dates, so a report says which code produced it.")
@@ -8268,20 +8268,17 @@ With process-marked articles, each of their threads.  Whatever
   "Redraw the summary lines of server articles NUMS of GROUP.
 Their label columns then update.  ACCOUNT is the nngmail account.
 
-Lines are re-inserted from the bottom of the buffer up.
-`gnus-summary-update-article-line' deletes and re-inserts one line and
-then shifts the recorded positions of every line after it by the size
-difference; a second update higher up, done before that shift is
-consistent with the buffer, re-inserts at a stale position and the line
-appears one row off, with another article's indentation and thread
-glyph (seen 2026-11-05 as foreign messages nested under a thread).
-Going bottom-up, every position a later update reads is still valid.
-Only lines the buffer shows are touched: `gnus-summary-goto-subject'
-with FORCE would *insert* an article that is in the group but not in
-the current display (read, limited away, a propagated thread member),
-grafting it under whatever line is above, which is the other way a
-foreign message appeared nested in a thread."
-  (let (todo)
+A line in a thread is redrawn by regenerating the whole summary, as
+`gnus-summary-sort' does: the thread glyphs (%B) of an adopted false
+root and its children come from state that exists only during
+`gnus-summary-prepare', and `gnus-summary-update-article-line' draws
+them wrong (the root loses its `>' and the children their arms; seen
+2026-11-05 and 2026-11-08).  Hidden subtrees are hidden again and point
+is restored.  A line outside any thread is re-inserted on its own,
+which is cheap and exact.  Only displayed articles count: a FORCE
+`gnus-summary-goto-subject' would insert an article the summary does
+not show and graft it under the line above."
+  (let (todo threaded)
     (dolist (num nums)
       (when-let* ((local (nngmail--num->local account group num))
                   (h (nngmail--header account num))
@@ -8292,18 +8289,32 @@ foreign message appeared nested in a thread."
           (setf (mail-header-number h2) local)
           (setq gnus-newsgroup-headers
                 (cons h2 (cl-remove local gnus-newsgroup-headers :key #'mail-header-number)))
-          (push (list (gnus-data-pos data) local h2) todo))))
-    (save-excursion
-      (pcase-dolist (`(,_pos ,local ,h2) (sort todo (lambda (a b) (> (car a) (car b)))))
-        (when (gnus-summary-goto-subject local nil t)
-          ;; `gnus-summary-update-line' only redoes marks and highlight;
-          ;; the line text (the label cells) is re-rendered from the
-          ;; header by `gnus-summary-update-article-line', which also
-          ;; puts the new header into Gnus's thread data.  An article in
-          ;; no thread (an error there) keeps its line.
-          (condition-case nil
-              (gnus-summary-update-article-line local h2)
-            (error (gnus-summary-update-line))))))))
+          ;; `gnus-summary-prepare' renders the thread tree, whose nodes
+          ;; hold their own header objects: put the new one there too.
+          (when-let* ((node (gnus-id-to-thread (mail-header-id h2))))
+            (setcar node h2))
+          (push (list (gnus-data-pos data) local h2) todo)
+          (when (and gnus-show-threads
+                     (or (> (gnus-data-level data) 0)
+                         (cdr (gnus-summary-articles-in-thread local))))
+            (setq threaded t)))))
+    (cond
+     ((null todo))
+     (threaded
+      (let ((current (gnus-summary-article-number))
+            (inhibit-read-only t)
+            (gnus-summary-prepare-hook nil))
+        (gnus-summary-prepare)
+        (gnus-summary-maybe-hide-threads)
+        (when current (gnus-summary-goto-subject current nil t))))
+     (t
+      (save-excursion
+        ;; bottom-up: each re-insert shifts the recorded positions below it
+        (pcase-dolist (`(,_pos ,local ,h2) (sort todo (lambda (a b) (> (car a) (car b)))))
+          (when (gnus-summary-goto-subject local nil t)
+            (condition-case nil
+                (gnus-summary-update-article-line local h2)
+              (error (gnus-summary-update-line))))))))))
 
 (defun nngmail--announce-label-edit (account group nums add remove)
   "Say what a label edit on NUMS of GROUP did, naming the groups it touched.
